@@ -253,6 +253,11 @@ function _domTreeBulk(cmd, a1, a2) {
   return result;
 }
 // Numeric reads on the native fast path; see op_dom_nav. -1 means "none".
+// String reads without JSON; see node_text in ops.rs (0 tagName, 1 localName,
+// 2 namespaceURI, 3 textContent, 4 nodeName, 5 innerHTML, 6 outerHTML).
+function _text(code, nid) {
+  return __obscuraCore.ops.op_dom_text(code, nid >>> 0, _realmFrameId);
+}
 function _nav(code, nid) {
   return __obscuraCore.ops.op_dom_nav(code, nid >>> 0, _realmFrameId);
 }
@@ -2459,13 +2464,13 @@ class Node {
 
   constructor(nid) { this._nid = nid; }
   get nodeType() { return _nav(5, this._nid); }
-  get nodeName() { return _domParse("node_name", this._nid) || ""; }
+  get nodeName() { return _text(4, this._nid); }
   get ownerDocument() { return globalThis.document; }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
     try { return _documentBase(); } catch (e) { return ""; }
   }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() { return _text(3, this._nid); }
   set textContent(v) {
     // One native call replaces the children of an element that owns no
     // stylesheets; anything else takes the general path below.
@@ -2506,7 +2511,7 @@ class Node {
   }
   get nodeValue() {
     const t = this.nodeType;
-    if (t === 3 || t === 8) return _domParse("text_content", this._nid) ?? "";
+    if (t === 3 || t === 8) return _text(3, this._nid);
     return null;
   }
   set nodeValue(v) {
@@ -2822,11 +2827,11 @@ class Node {
 }
 class CharacterData extends Node {
   get data() {
-    return _domParse("text_content", this._nid) ?? "";
+    return _text(3, this._nid);
   }
   set data(v) {
     const observed = globalThis.__mutationObservers?.length;
-    const oldValue = observed ? _domParse("text_content", this._nid) ?? "" : "";
+    const oldValue = observed ? _text(3, this._nid) : "";
     _dom("set_text_content", this._nid, v === null ? "" : String(v));
     if (observed) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
@@ -3788,7 +3793,7 @@ class Element extends Node {
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
     // for every comparison adds thousands of calls on modern component trees.
     if (this._tagName !== undefined) return this._tagName;
-    this._tagName = _domParse("tag_name", this._nid) || "";
+    this._tagName = _text(0, this._nid);
     return this._tagName;
   }
   get nodeName() { return this.tagName; }
@@ -3797,7 +3802,7 @@ class Element extends Node {
     // component directly preserves case-sensitive SVG/MathML names such as
     // `linearGradient`; deriving this from HTML's uppercased tagName loses it.
     if (this._lname !== undefined) return this._lname;
-    const ln = _domParse("local_name", this._nid)
+    const ln = _text(1, this._nid)
       || (this.tagName || "").toLowerCase();
     if (ln) this._lname = ln;
     return ln;
@@ -3826,7 +3831,7 @@ class Element extends Node {
     // instead of an SVGAnimatedString. An element's namespace never changes,
     // so cache it like _lname.
     if (this._nsCache !== undefined) return this._nsCache;
-    let ns = _domParse("namespace_uri", this._nid) || "";
+    let ns = _text(2, this._nid);
     // Nodes with no element name recorded fall back to the previous heuristic.
     if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
     this._nsCache = ns;
@@ -3834,7 +3839,7 @@ class Element extends Node {
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
   // side (issue #463), so this needs no template special case.
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _text(5, this._nid); }
   set innerHTML(v) {
     if (this.localName === 'template') {
       this.content.innerHTML = v;
@@ -3877,7 +3882,7 @@ class Element extends Node {
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
     }
   }
-  get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
+  get outerHTML() { return _text(6, this._nid); }
   get innerText() {
     if (!this.isConnected
         || typeof __obscuraCore.ops.op_computed_style !== 'function'
@@ -3983,7 +3988,7 @@ class Element extends Node {
         ? this._nullNamespaceAttrs.get(n)
         : null;
     }
-    return _domParse("get_attribute", this._nid, n);
+    return __obscuraCore.ops.op_dom_attr(this._nid >>> 0, n, _realmFrameId);
   }
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
@@ -6600,7 +6605,7 @@ class DocumentFragment extends Node {
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _text(5, this._nid); }
   set innerHTML(v) {
     const html = String(v ?? "");
     if (this._fragmentContext) {
@@ -7212,37 +7217,39 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
-function _elementClassFor(nid) {
-  const tag = _domParse("tag_name", nid);
-  // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
-  // case, so keep the common HTML path fast and only inspect the native
-  // namespace for possible SVG wrappers.
-  if (tag && tag !== tag.toUpperCase()
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    const svgClass = _svgElementClasses[tag];
+// Wrapper class for a native element class code; see element_class_kind in
+// ops.rs. A class that is not installed falls back the way the old tag-name
+// chain did.
+function _classForKind(kind) {
+  switch (kind) {
+    case 0: return Element;
+    case 1: return globalThis.SVGElement || Element;
+    case 2: return globalThis.SVGPathElement || globalThis.SVGElement || Element;
+    case 3: return globalThis.SVGSVGElement || globalThis.SVGElement || Element;
+    case 4: return globalThis.HTMLFormElement || Element;
+    case 5: return globalThis.HTMLInputElement || Element;
+    case 6: return globalThis.HTMLTextAreaElement || Element;
+    case 7: return globalThis.HTMLMetaElement || Element;
+    case 8: return globalThis.HTMLSlotElement || Element;
+    case 9: return HTMLImageElement;
+    case 10: return globalThis.HTMLCanvasElement || Element;
+    case 11: return HTMLAudioElement;
+    case 12: return HTMLVideoElement;
+    case 13: return HTMLTrackElement;
+    default: return Element;
+  }
+}
+// Kinds 1-3 are case-preserved SVG-namespace elements; their concrete
+// interface comes from the element's own name, like the native-name path.
+function _classForElement(kind, nid) {
+  if (kind >= 1 && kind <= 3) {
+    const svgClass = _svgElementClasses[_domParse("tag_name", nid)];
     if (svgClass) return svgClass;
-    if (globalThis.SVGElement) return globalThis.SVGElement;
   }
-  if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
-  if (tag === "INPUT" && globalThis.HTMLInputElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
-  if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
-  if (tag === "META" && globalThis.HTMLMetaElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
-      && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
-  // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
-  // (createElementNS + cloneNode lands here) stays a plain Element.
-  if (tag === "SLOT" && globalThis.HTMLSlotElement
-      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
-    return globalThis.HTMLSlotElement;
-  }
-  if (tag === "IMG") return HTMLImageElement;
-  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
-  if (tag === "AUDIO") return HTMLAudioElement;
-  if (tag === "VIDEO") return HTMLVideoElement;
-  if (tag === "TRACK") return HTMLTrackElement;
-  return Element;
+  return _classForKind(kind);
+}
+function _elementClassFor(nid) {
+  return _classForElement(_nav(9, nid) >> 4, nid);
 }
 function _elementClassForKnownName(namespace, qualifiedName) {
   const localName = qualifiedName.includes(":")
@@ -7272,9 +7279,10 @@ function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   const hit = _cache.get(nid);
   if (hit !== undefined) return hit;
-  const t = _nav(5, nid);
+  const info = _nav(9, nid);
+  const t = info & 15;
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) { const C = _classForElement(info >> 4, nid); n = new C(nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
