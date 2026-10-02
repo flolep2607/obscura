@@ -97,6 +97,20 @@ pub struct ShapeBuffer {
 
     /// Buffer for sets of layout glyphs.
     glyph_sets: Vec<Vec<LayoutGlyph>>,
+
+    /// Compiled Rustybuzz shape plans for default-instance faces. Compiling a
+    /// plan walks the face's GSUB/GPOS feature tables, which costs more than
+    /// shaping a short word, and the result depends only on the key.
+    shape_plans: std::collections::HashMap<ShapePlanKey, rustybuzz::ShapePlan>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapePlanKey {
+    font: fontdb::ID,
+    direction: rustybuzz::Direction,
+    script: rustybuzz::Script,
+    language: Option<rustybuzz::Language>,
+    features: Vec<(rustybuzz::ttf_parser::Tag, u32)>,
 }
 
 impl fmt::Debug for ShapeBuffer {
@@ -229,14 +243,35 @@ fn shape_fallback(
         ));
     }
 
-    let shape_plan = rustybuzz::ShapePlan::new(
-        face,
-        buffer.direction(),
-        Some(buffer.script()),
-        buffer.language().as_ref(),
-        &rb_font_features,
-    );
-    let glyph_buffer = rustybuzz::shape_with_plan(face, &shape_plan, buffer);
+    let glyph_buffer = if varied_face.is_none() {
+        let key = ShapePlanKey {
+            font: font.id(),
+            direction: buffer.direction(),
+            script: buffer.script(),
+            language: buffer.language(),
+            features: rb_font_features.iter().map(|f| (f.tag, f.value)).collect(),
+        };
+        if !scratch.shape_plans.contains_key(&key) {
+            let plan = rustybuzz::ShapePlan::new(
+                face,
+                key.direction,
+                Some(key.script),
+                key.language.as_ref(),
+                &rb_font_features,
+            );
+            scratch.shape_plans.insert(key.clone(), plan);
+        }
+        rustybuzz::shape_with_plan(face, &scratch.shape_plans[&key], buffer)
+    } else {
+        let shape_plan = rustybuzz::ShapePlan::new(
+            face,
+            buffer.direction(),
+            Some(buffer.script()),
+            buffer.language().as_ref(),
+            &rb_font_features,
+        );
+        rustybuzz::shape_with_plan(face, &shape_plan, buffer)
+    };
     let glyph_infos = glyph_buffer.glyph_infos();
     let glyph_positions = glyph_buffer.glyph_positions();
 
