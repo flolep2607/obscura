@@ -1993,7 +1993,24 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         return "true".into();
     }
-    {
+    // Only these commands have a render or activity side effect; every other
+    // command (all the reads) skips the bookkeeping below.
+    if matches!(
+        cmd.as_str(),
+        "set_attribute"
+            | "set_form_value"
+            | "set_form_checked"
+            | "set_form_indeterminate"
+            | "remove_attribute"
+            | "set_attribute_ns"
+            | "remove_attribute_ns"
+            | "append_child"
+            | "remove_child"
+            | "insert_before"
+            | "set_inner_html"
+            | "set_inner_html_context"
+            | "set_text_content"
+    ) {
         // Scroll offsets belong to a node at its current tree position.
         // Temporary box/style loss keeps that latent state, but DOM removal,
         // reparenting, and subtree replacement reset the affected identities,
