@@ -15,10 +15,14 @@ path = "src/worker.rs"
 
 [features]
 default = []
+# mimalloc as the global allocator: fewer page faults and faster alloc/free on
+# layout-heavy pages, at the cost of a C dependency and a higher RSS ceiling.
+mimalloc = ["dep:mimalloc"]
 stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }
 obscura-browser = { workspace = true }
 obscura-mcp = { workspace = true }
 obscura-cdp = { workspace = true }

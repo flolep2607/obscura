@@ -334,6 +334,10 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const CLI_STACK_BYTES: usize = 512 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
