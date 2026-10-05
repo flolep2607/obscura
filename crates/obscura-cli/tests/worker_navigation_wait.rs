@@ -87,7 +87,12 @@ fn serve(mut stream: TcpStream) {
     if path == "/disconnect" {
         return;
     }
-    let (status, headers, body) = (200, "", "<title>Ready</title><script>globalThis.inlineRan = true; setTimeout(() => { globalThis.laterRan = true; }, 350);</script><p>Body</p>");
+    let (status, headers) = match path {
+        "/redirect" => (302, "Location: /missing\r\n"),
+        "/missing" => (404, ""),
+        _ => (200, ""),
+    };
+    let body = "<title>Ready</title><script>globalThis.inlineRan = true; setTimeout(() => { globalThis.laterRan = true; }, 350);</script><p>Body</p>";
     let response = format!(
         "HTTP/1.1 {status} Fixture\r\nContent-Type: text/html\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
     );
@@ -171,6 +176,7 @@ fn check_modes(stealth: bool) {
             worker.send(json!({"cmd": "navigate", "url": server.url("/"), "waitUntil": mode}));
         assert_eq!(response["ok"], true, "{mode}: {response}");
         assert_eq!(response["result"]["title"], "Ready");
+        assert_eq!(response["result"]["status"], 200);
         let inline = worker.send(json!({"cmd": "evaluate", "expression": "globalThis.inlineRan"}));
         assert_eq!(inline["result"], true, "parser script must run with {mode}");
         if mode.starts_with("networkidle") {
@@ -181,6 +187,17 @@ fn check_modes(stealth: bool) {
                 "{mode} must drive the event loop during its idle window"
             );
         }
+        let error_page =
+            worker.send(json!({"cmd":"navigate","url":server.url("/redirect"),"waitUntil":mode}));
+        assert_eq!(
+            error_page["ok"], true,
+            "{mode}: HTTP error remains a response"
+        );
+        assert_eq!(
+            error_page["result"]["status"], 404,
+            "{mode}: final document status after redirect"
+        );
+        assert_eq!(error_page["result"]["url"], server.url("/missing"));
     }
     assert_eq!(worker.navigate(&server.url("/"))["title"], "Ready");
 }
@@ -246,6 +263,11 @@ fn readiness_modes_preserve_non_http_navigation() {
         ] {
             let response = worker.send(json!({"cmd": "navigate", "url": url, "waitUntil": mode}));
             assert_eq!(response["ok"], true, "{mode}: {response}");
+            assert_eq!(
+                response["result"]["status"],
+                Value::Null,
+                "{mode}: non-HTTP navigation has no status"
+            );
         }
     }
 }

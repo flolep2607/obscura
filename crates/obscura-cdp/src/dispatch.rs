@@ -808,6 +808,15 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Accessibility" => {
             domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
         }
+        "HeapProfiler" if method == "collectGarbage" => {
+            match ctx.get_session_page_mut(&req.session_id).and_then(|page| page.js.as_mut()) {
+                Some(js) => {
+                    js.collect_garbage();
+                    Ok(json!({}))
+                }
+                None => Err("No JavaScript runtime".to_string()),
+            }
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
@@ -1197,6 +1206,29 @@ mod tests {
             params: json!({}),
             session_id: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_profiler_collect_garbage_reclaims_unreferenced_objects() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("heap-gc".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().execute_script("gc-allocations",
+            "globalThis.garbage = Array.from({length: 200000}, (_, i) => ({i}));",
+        ).unwrap();
+        let before = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        ctx.get_session_page_mut(&session).unwrap().evaluate("globalThis.garbage = null");
+        let response = dispatch(&CdpRequest {
+            session_id: session.clone(),
+            ..req("HeapProfiler.collectGarbage")
+        }, &mut ctx).await;
+        assert!(response.error.is_none(), "GC request failed: {:?}", response.error);
+        let after = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        assert!(after + 2 * 1024 * 1024 < before,
+            "explicit GC must reclaim discarded objects: {before} -> {after}");
     }
 
     #[tokio::test]

@@ -128,6 +128,34 @@ Default transport is stdio. See [Use the MCP server](Use-the-MCP-server.md).
 Render-enabled builds add `browser_screenshot` and `browser_pdf` to the MCP
 tool list. Streaming screencasts are available through CDP rather than MCP.
 
+## Worker navigation responses
+
+`obscura-worker` accepts newline-delimited JSON commands on stdin and emits one
+JSON response per command on stdout. For example:
+
+```json
+{"cmd":"navigate","url":"https://example.com/"}
+```
+
+A completed navigation includes the final document's HTTP status alongside the
+existing title and URL:
+
+```json
+{"ok":true,"result":{"title":"Example Domain","url":"https://example.com/","status":200}}
+```
+
+`status` is the main document's final HTTP response code after redirects, not a
+script, image, or child frame's response. HTTP errors such as 404 and 503 still
+return `ok: true`: the server responded and the error document can be inspected
+with `dump_html`, `dump_text`, or `evaluate`. Navigation without an HTTP response,
+such as `about:blank`, a `data:` URL, or a tracker blocked before the request,
+returns `status: null`. A transport or
+navigation failure retains the existing `{"ok":false,"error":"..."}` envelope
+without a `result` object.
+
+The status field is additive. Navigation timing and the other worker commands
+are unchanged.
+
 ## Worker navigation readiness
 
 `obscura-worker` accepts newline-delimited JSON commands on stdin and writes
@@ -147,5 +175,5 @@ run in every mode. Network-idle modes additionally drive the event loop until
 active requests remain at or below zero or two, respectively, for 500 ms, with
 the engine's existing five-second idle deadline. `domcontentloaded` uses the
 engine's DOM readiness boundary; it does not change script execution or resource
-warmup semantics. Successful responses retain their existing `title` and `url`
+warmup semantics. Successful responses retain their existing `title`, `url`, and `status`
 fields.

@@ -34,6 +34,40 @@ const HN_HTML: &str = r##"
     </table>
 "##;
 
+#[cfg(feature = "paint")]
+#[test]
+fn mixed_content_shaped_runs_retain_inline_owner_geometry() {
+    for content in ["ABCD", "AB<b id='nested'>CD</b>"] {
+        let tree = parse_html(&format!(
+            "<style>body{{margin:0;font:20px/24px monospace}}</style>\
+             <div id='parent'>AAAA<div style='height:30px'></div>\
+             <span id='owner'>{content}</span></div>"));
+        let layout = layout_dom(&tree, (200.0, 200.0));
+        let owner = tree.get_element_by_id("owner").unwrap();
+        let rect = layout.rects.get(&owner).expect("shaped inline owner has geometry");
+        assert!(rect.x.abs() < 0.01 && (52.0..=57.0).contains(&rect.y)
+            && (40.0..=55.0).contains(&rect.width) && (18.0..=26.0).contains(&rect.height),
+            "inline following a 24px line and 30px block: {rect:?}");
+        let pieces = layout.inline_fragments.get(&owner).expect("canonical inline fragments");
+        assert!(!pieces.is_empty());
+        for piece in pieces {
+            assert!(piece.width > 0.0 && piece.height > 0.0
+                && piece.x >= rect.x && piece.y >= rect.y
+                && piece.x + piece.width <= rect.x + rect.width + 0.01
+                && piece.y + piece.height <= rect.y + rect.height + 0.01,
+                "inline fragments remain within their owner bounds: {piece:?}, {rect:?}");
+        }
+        let parent = tree.get_element_by_id("parent").unwrap();
+        assert!((layout.rects[&parent].height - 78.0).abs() < 0.01,
+            "preserving inline ownership must not add a line or change block flow");
+        if let Some(nested) = tree.get_element_by_id("nested") {
+            let nested = layout.rects.get(&nested).expect("nested inline owner has geometry");
+            assert!((20.0..=28.0).contains(&nested.x) && (20.0..=28.0).contains(&nested.width)
+                && (nested.y - rect.y).abs() < 1.0, "nested text bounds: {nested:?}");
+        }
+    }
+}
+
 /// Top-left of the tightest laid-out element box whose text contains
 /// `needle`. Text geometry is no longer a per-word list: a pure-text
 /// container collapses to a single cosmic-text inline formatting context
@@ -4424,6 +4458,36 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
 }
 
 #[test]
+fn nested_grid_input_contributes_intrinsic_height_without_preventing_stretch() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:14px Arial; line-height:22px }
+          .outer { display:grid; width:214px; align-items:center }
+          .editor { display:inline-grid; grid-area:1 / 1 / 2 / 3;
+                    grid-template-columns:0 min-content }
+          input { display:block; width:100%; grid-area:1 / 2;
+                  font:inherit; min-width:2px; padding:0; border:0 }
+          .short { grid-template-rows:12px }
+        </style>
+        <div class="outer"><div class="editor" id="auto-editor"><input id="auto-input"></div></div>
+        <div class="outer"><div class="editor short" id="short-editor"><input id="short-input"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (input, editor, height) in [
+        ("auto-input", "auto-editor", 22.0),
+        ("short-input", "short-editor", 12.0),
+    ] {
+        let input_rect = layout.rects[&tree.get_element_by_id(input).unwrap()];
+        let editor_rect = layout.rects[&tree.get_element_by_id(editor).unwrap()];
+        assert_eq!(input_rect.height, height, "{input}");
+        assert_eq!(editor_rect.height, height, "{editor}");
+        assert!(input_rect.width >= 2.0, "{input}");
+    }
+}
+
+#[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(
         r#"
@@ -4483,6 +4547,56 @@ fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     assert!(auto_button.width > 20.0 && auto_button.width < 30.0);
     assert_eq!(auto_button.height, 300.0);
     assert_eq!(auto_button.x + auto_button.width, auto_button_grid.x + auto_button_grid.width);
+}
+
+#[test]
+fn inline_block_percentage_height_uses_definite_block_content_height() {
+    let tree = parse_html(r#"<!doctype html>
+        <style>
+          html, body { margin:0 }
+          .switch { position:relative; width:32px; height:16px; line-height:1 }
+          input { position:absolute; width:100%; height:100%; margin:0; opacity:0; z-index:-1000 }
+          label { display:inline-block; box-sizing:border-box; width:100%; height:100%; border:1px solid }
+          .padded { height:30px; box-sizing:border-box; padding:4px; border:1px solid }
+          .indefinite { height:auto; min-height:40px }
+        </style>
+        <div class="switch"><input type="checkbox"><label id="percentage"></label></div>
+        <div class="switch"><input type="checkbox"><label id="pixels" style="height:16px"></label></div>
+        <div class="switch padded"><label id="content-box"></label></div>
+        <div class="switch padded"><label id="half" style="height:50%"></label></div>
+        <div class="switch indefinite"><label id="indefinite"></label></div>
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (name, width, height) in [
+        ("percentage", 32.0, 16.0), ("pixels", 32.0, 16.0),
+        ("content-box", 22.0, 20.0), ("half", 22.0, 10.0), ("indefinite", 32.0, 2.0),
+    ] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!(rect.width, width, "{name}");
+        assert_eq!(rect.height, height, "{name}");
+    }
+}
+
+#[test]
+fn inherited_font_shorthand_overrides_native_control_typography() {
+    let tree = parse_html(r#"
+        <style>
+          body { font:700 20px/30px Arial }
+          input { display:block; border:0; padding:0 }
+        </style>
+        <input id="inherit" style="font:inherit">
+        <input id="unset" style="font:unset">
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for name in ["inherit", "unset"] {
+        let node = tree.get_element_by_id(name).unwrap();
+        let style = &layout.styles[&node];
+        assert_eq!(style.font_size, Some(20.0), "{name}");
+        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
+        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
+        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
+        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
+    }
 }
 
 #[test]

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::ops::{max_live_frames, NavigationTiming};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -185,6 +186,7 @@ pub struct NetworkEvent {
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub error_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +266,7 @@ pub struct Page {
     /// keeps this baseline across subsequent override calls and restores it
     /// only when the override is cleared.
     device_metrics_baseline: Option<DeviceMetricsBaseline>,
+    reduced_motion: bool,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -280,6 +283,7 @@ pub struct Page {
     /// It is reset once author styles are installed, so stylesheet download
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
+    navigation_timing: NavigationTiming,
     /// Optional page-scoped ceiling for an end-to-end navigation. Automation
     /// frontends set this from their request timeout so a caller asking for a
     /// 50-second navigation is not silently cut off by the process default.
@@ -342,18 +346,6 @@ pub struct Page {
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
-
-/// How many child frame realms one document may hold at once.
-///
-/// Real pages use a handful; the cap exists so a page that creates iframes in a
-/// loop cannot make the engine hold an unbounded number of contexts and DOM
-/// trees. Frames are released when the document is replaced.
-fn max_live_frames() -> usize {
-    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
-}
 
 /// The first navigation counts. The low default stops a page that resets
 /// `location` on every load.
@@ -1117,10 +1109,12 @@ impl Page {
             screen_metrics_emulated: false,
             locale_override: None,
             device_metrics_baseline: None,
+            reduced_motion: false,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
+            navigation_timing: NavigationTiming::default(),
             navigation_timeout: None,
             navigation_chain_limit: None,
             history: Vec::new(),
@@ -1413,6 +1407,9 @@ impl Page {
     /// page's same-origin frame table. This also covers a frame rejected before
     /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
     fn forget_frame_references(&mut self, frame_id: u32, parent_frame_id: u32) {
+        if let Some(js) = self.js.as_mut() {
+            js.forget_frame_state(frame_id);
+        }
         let script = format!(
             "if (globalThis.__obscura_frameElements[{frame_id}] &&\
              globalThis.__obscura_frameElements[{frame_id}]._frameId === {frame_id}) {{\
@@ -1698,6 +1695,13 @@ impl Page {
         self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        self.reduced_motion = reduce;
+        if let Some(js) = &mut self.js {
+            js.set_reduced_motion(reduce);
+        }
+    }
+
     /// Set the screenshot surface density without changing CSS layout. CDP
     /// uses zero to disable its override, which restores the native 1x surface
     /// in Obscura's headless-only model.
@@ -1849,7 +1853,9 @@ impl Page {
             rt.set_dom(dom);
         }
 
+        rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
+        rt.set_reduced_motion(self.reduced_motion);
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
@@ -2846,6 +2852,7 @@ impl Page {
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
         if let Some(js) = &mut self.js {
+            js.record_navigation_timing("domInteractive");
             let _ = js.execute_script(
                 "<ready-state-interactive>",
                 "globalThis.__documentReadyState__ = 'interactive';",
@@ -2931,11 +2938,15 @@ impl Page {
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
-            let _ = js.execute_script(
+            js.record_navigation_timing("domContentLoadedEventStart");
+            let completed = js.execute_script(
                 "<dom-content-loaded>",
                 "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
+            if completed.is_ok() {
+                js.record_navigation_timing("domContentLoadedEventEnd");
+            }
 
             let load_blockers_finished =
                 Self::drive_load_delaying_scripts(js, script_deadline).await;
@@ -2948,7 +2959,9 @@ impl Page {
             // readyState becomes complete before the load event. A script
             // inserted by an onload handler is therefore post-load work and
             // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
+            js.record_navigation_timing("domComplete");
+            js.record_navigation_timing("loadEventStart");
+            let completed = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  try {\n\
@@ -2956,6 +2969,9 @@ impl Page {
                    try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
                  } catch(e) {}",
             );
+            if completed.is_ok() {
+                js.record_navigation_timing("loadEventEnd");
+            }
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -3362,6 +3378,7 @@ impl Page {
         referrer: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        self.navigation_timing = NavigationTiming::default();
 
         // The previous document's background loads end with the document.
         self.retire_render_resources();
@@ -3423,6 +3440,7 @@ impl Page {
             return Ok(());
         }
 
+        self.navigation_timing.record("fetchStart");
         let response = if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
@@ -3453,13 +3471,14 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        self.navigation_timing.record("responseEnd");
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
         // corrupts them (issue #340). Text-like types stay as text.
         let main_is_binary = !is_text_like_content_type(response.content_type());
         self.record_network_event_with_body(
-            url.as_str(),
+            response.url.as_str(),
             "GET",
             "Document",
             response.status,
@@ -3479,6 +3498,7 @@ impl Page {
         let (body_text, encoding_name) =
             obscura_net::decode_response_with_name(&response.body, response.content_type());
         self.encoding = encoding_name.to_string();
+        self.navigation_timing.record("domLoading");
         let dom = parse_html(&body_text);
 
         self.title = dom
@@ -3618,61 +3638,77 @@ impl Page {
                 _ => 0,
             };
 
-            // Same hazard as the post-script settle: a synchronous poll can pin
-            // the thread past the 5s network-idle deadline, so arm a watchdog
-            // that terminates the isolate ~500ms past it.
-            let netidle_wd = self
-                .js
-                .as_mut()
-                .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
-            let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-            let mut idle_since: Option<tokio::time::Instant> = None;
-
-            loop {
-                let active = self.http_client.active_requests();
-                let now = tokio::time::Instant::now();
-
-                if active <= threshold {
-                    if idle_since.is_none() {
-                        idle_since = Some(now);
-                    }
-                    if now.duration_since(idle_since.unwrap())
-                        >= tokio::time::Duration::from_millis(500)
-                    {
-                        break;
-                    }
-                } else {
-                    idle_since = None;
-                }
-
-                if now >= deadline {
-                    tracing::debug!(
-                        "Network idle timeout reached with {} active requests",
-                        active
-                    );
-                    break;
-                }
-
-                if let Some(js) = &mut self.js {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from_millis(50),
-                        js.run_event_loop(),
-                    )
-                    .await;
-                } else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-            }
-
-            if let Some(token) = netidle_wd {
-                if let Some(js) = self.js.as_mut() {
-                    js.disarm_watchdog(token);
-                }
-            }
-            self.lifecycle = LifecycleState::NetworkIdle;
+            self.wait_for_network_idle(threshold).await;
         }
 
         Ok(())
+    }
+
+    async fn wait_for_network_idle(&mut self, threshold: u32) {
+        // Same hazard as the post-script settle: a synchronous poll can pin
+        // the thread past the 5s network-idle deadline, so arm a watchdog
+        // that terminates the isolate ~500ms past it.
+        let netidle_wd = self
+            .js
+            .as_mut()
+            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        let mut idle_since: Option<tokio::time::Instant> = None;
+
+        loop {
+            let active = self.http_client.active_requests();
+            let now = tokio::time::Instant::now();
+
+            if active <= threshold {
+                if idle_since.is_none() {
+                    idle_since = Some(now);
+                }
+                if now.duration_since(idle_since.unwrap())
+                    >= tokio::time::Duration::from_millis(500)
+                {
+                    break;
+                }
+            } else {
+                idle_since = None;
+            }
+
+            if now >= deadline {
+                tracing::debug!(
+                    "Network idle timeout reached with {} active requests",
+                    active
+                );
+                break;
+            }
+
+            // An idle runtime can stay parked. Wake at the existing quiet
+            // window or hard deadline instead of adding a final full slice.
+            let readiness_deadline = idle_since
+                .map_or(deadline, |since| since + tokio::time::Duration::from_millis(500))
+                .min(deadline);
+            if let Some(js) = &mut self.js {
+                let next_check = readiness_deadline.min(now + tokio::time::Duration::from_millis(50));
+                crate::idle_deadline::wait_for_activity(
+                    next_check,
+                    next_check == readiness_deadline,
+                    js.wait_for_event_loop_activity(),
+                )
+                .await;
+            } else {
+                let next_check = readiness_deadline.min(now + tokio::time::Duration::from_millis(100));
+                crate::idle_deadline::wait_for_activity(
+                    next_check,
+                    next_check == readiness_deadline,
+                    std::future::pending::<()>(),
+                ).await;
+            }
+        }
+
+        if let Some(token) = netidle_wd {
+            if let Some(js) = self.js.as_mut() {
+                js.disarm_watchdog(token);
+            }
+        }
+        self.lifecycle = LifecycleState::NetworkIdle;
     }
 
     /// Builds the child frames of the document that just loaded.
@@ -3702,11 +3738,9 @@ impl Page {
 
         for _ in 0..ROUNDS {
             if let Some(js) = &mut self.js {
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(ROUND_MS),
-                    js.run_event_loop(),
-                )
-                .await;
+                // A Tokio timeout cannot interrupt synchronous microtasks.
+                // Use the same cooperative, watchdog-bounded pump as settling.
+                let _ = js.run_event_loop_bounded(ROUND_MS).await;
             }
             if !self.advance_frames().await {
                 break;
@@ -3715,13 +3749,14 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
         self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
-            "<!DOCTYPE html><html><head></head><body></body></html>",
+            "<html><head></head><body></body></html>",
         ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
@@ -4236,12 +4271,13 @@ impl Page {
                 intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
-                resource_type: "Fetch".to_string(),
+                resource_type: ev.resource_type,
                 status: ev.status,
                 headers: std::collections::HashMap::new(),
                 response_headers: Arc::new(ev.response_headers),
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
+                error_text: ev.error_text,
             });
         }
     }
@@ -4544,6 +4580,7 @@ impl Page {
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
+            error_text: None,
         });
         request_id
     }
@@ -4658,6 +4695,7 @@ impl Page {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.navigation_timing = js.navigation_timing();
         // Preserve console messages logged before suspension: dropping the
         // runtime below would otherwise lose any not yet drained (#971).
         let pending_console = js.take_pending_console_messages();
@@ -4971,6 +5009,182 @@ mod tests {
     use base64::Engine as _;
     use obscura_dom::parse_html;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_navigation_has_no_doctype_and_starts_in_quirks_mode() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("blank-mode".into()));
+        let mut page = super::Page::new("blank-mode".into(), context);
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.evaluate(r#"(() => [
+            document.compatMode, document.doctype,
+            Array.from(document.childNodes, node => node.nodeType),
+            document.documentElement.nodeName, document.head.nodeName, document.body.nodeName
+        ])()"#), serde_json::json!(["BackCompat", null, [1], "HTML", "HEAD", "BODY"]));
+        assert!(page.with_dom(|dom| dom.is_quirks()).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_quiet_deadline_does_not_gain_an_extra_polling_slice() {
+        use std::future::Future as _;
+
+        // No JavaScript runtime is needed to test the lifecycle deadline.
+        // This also keeps unrelated V8 maintenance wakes out of the clock test.
+        let context = std::sync::Arc::new(crate::BrowserContext::new("idle-deadline".into()));
+        let mut page = super::Page::new("idle-deadline".into(), context);
+        assert!(page.js.is_none());
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut wait = Box::pin(page.wait_for_network_idle(0));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(wait.as_mut().poll(&mut cx).is_pending());
+
+        // Model a delayed executor poll just before the existing quiet window
+        // ends. The next wake belongs to that window, not a fresh full slice.
+        tokio::time::advance(std::time::Duration::from_millis(490)).await;
+        assert!(wait.as_mut().poll(&mut cx).is_pending(),
+            "network idle must not complete before the quiet window");
+        tokio::time::advance(std::time::Duration::from_millis(11)).await;
+        assert!(wait.as_mut().poll(&mut cx).is_ready(),
+            "quiet-window expiry must not wait for another polling slice");
+        drop(wait);
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(501));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
+    }
+
+    fn network_idle_test_page() -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "network-idle-regression".into(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("network-idle-regression".into(), context);
+        page.url = Some(url::Url::parse("http://example.test/").unwrap());
+        page.dom = Some(parse_html("<html><body></body></html>"));
+        page.init_js();
+        page
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_preserves_quiet_window_and_page_tasks() {
+        let mut page = network_idle_test_page();
+        page.js.as_mut().unwrap().execute_script("network-idle-interval", r#"
+            globalThis.__idleTicks = 0;
+            globalThis.__idleObserved = false;
+            new MutationObserver(() => { __idleObserved = true; })
+                .observe(document.body, { attributes: true });
+            const id = setInterval(() => {
+                if (++__idleTicks === 3) {
+                    clearInterval(id);
+                    Promise.resolve().then(() => document.body.setAttribute('data-ready', 'yes'));
+                }
+            }, 20);
+        "#).unwrap();
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
+            .await.expect("quiet page must finish within its normal window");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
+        assert_eq!(page.js.as_mut().unwrap().evaluate("[__idleTicks, __idleObserved]").unwrap(),
+            serde_json::json!([3, true]));
+    }
+
+    async fn network_idle_held_request(
+        client: std::sync::Arc<obscura_net::ObscuraHttpClient>,
+    ) -> (tokio::sync::oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() < 16384);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await;
+        });
+        let fetch = tokio::spawn(async move {
+            assert_eq!(client.fetch(&url).await.unwrap().status, 200);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+            .await.expect("request reached fixture").unwrap();
+        (release_tx, fetch)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_two_allows_two_active_requests() {
+        let mut page = network_idle_test_page();
+        let (release_a, fetch_a) = network_idle_held_request(page.http_client.clone()).await;
+        let (release_b, fetch_b) = network_idle_held_request(page.http_client.clone()).await;
+        assert_eq!(page.http_client.active_requests(), 2);
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(2))
+            .await.expect("two active requests must not force the five-second deadline");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+        assert_eq!(page.http_client.active_requests(), 2, "threshold two must allow both held requests");
+        release_a.send(()).unwrap();
+        release_b.send(()).unwrap();
+        fetch_a.await.unwrap();
+        fetch_b.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_zero_starts_quiet_window_after_request_completion() {
+        let mut page = network_idle_test_page();
+        let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
+        let completed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = completed.clone();
+        let release_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+            release.send(()).unwrap();
+            fetch.await.unwrap();
+            *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
+            .await.expect("completed request must permit network idle");
+        release_task.await.unwrap();
+        assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
+            "an active request must prevent an earlier quiet-window start");
+        assert_eq!(page.http_client.active_requests(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_restarts_quiet_window_when_request_begins() {
+        let mut page = network_idle_test_page();
+        let client = page.http_client.clone();
+        let completed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let recorded = completed.clone();
+        let request_task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let (release, fetch) = network_idle_held_request(client).await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            release.send(()).unwrap();
+            fetch.await.unwrap();
+            *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
+            .await.expect("a completed late request must permit network idle");
+        request_task.await.unwrap();
+        assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
+            "new traffic must reset the original quiet window");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_keeps_five_second_deadline_for_stuck_request() {
+        let mut page = network_idle_test_page();
+        let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(7), page.wait_for_network_idle(0))
+            .await.expect("network-idle deadline must still finish");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert_eq!(page.http_client.active_requests(), 1);
+        release.send(()).unwrap();
+        fetch.await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+    }
     fn install_linked_stylesheet(
         runtime: &mut obscura_js::runtime::ObscuraJsRuntime,
         index: usize,
@@ -7389,6 +7603,82 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_records_lifecycle_boundaries_not_future_events() {
+        let mut page = import_map_test_page(
+            "navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        let html = r#"<!doctype html><script>
+            globalThis.__navigationSamples = [];
+            function sample() {
+                const timing = performance.timing;
+                __navigationSamples.push([
+                    timing.navigationStart, timing.responseEnd,
+                    timing.domContentLoadedEventStart, timing.domContentLoadedEventEnd,
+                    timing.loadEventStart, timing.loadEventEnd
+                ]);
+            }
+            sample();
+            document.addEventListener('DOMContentLoaded', sample);
+            window.addEventListener('load', sample);
+        </script><p>Real navigation timing</p>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+        page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+        let actual = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const [parser, dom, load] = __navigationSamples;
+            const final = performance.timing;
+            return [
+                parser[3] === 0 && parser[5] === 0,
+                Number.isFinite(parser[1]) && parser[1] >= parser[0],
+                dom[2] > 0 && dom[3] === 0,
+                load[4] > 0 && load[5] === 0,
+                final.domContentLoadedEventEnd >= dom[2],
+                final.loadEventStart >= final.domContentLoadedEventEnd,
+                final.loadEventEnd >= load[4],
+                performance.timeOrigin >= final.navigationStart
+                    && performance.timeOrigin < final.navigationStart + 1
+            ];
+        })()"#).unwrap();
+        assert_eq!(actual, serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_survives_suspension_but_resets_on_navigation() {
+        let mut page = import_map_test_page(
+            "navigation-timing-retention", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        page.navigate("data:text/html,<p>First</p>").await.unwrap();
+        let expression = "[performance.timeOrigin, performance.timing.navigationStart, performance.timing.loadEventEnd]";
+        let before = page.js.as_mut().unwrap().evaluate(expression).unwrap();
+        assert!(before[2].as_f64().unwrap() > before[1].as_f64().unwrap());
+        page.suspend_js();
+        page.resume_js();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(expression).unwrap(), before);
+        page.navigate("data:text/html,<p>Second</p>").await.unwrap();
+        let after = page.js.as_mut().unwrap().evaluate(expression).unwrap();
+        assert!(after[0].as_f64().unwrap() > before[0].as_f64().unwrap());
+        assert!(after[1].as_f64().unwrap() >= before[2].as_f64().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_terminated_handlers_do_not_record_completion() {
+        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "250");
+        let mut page = import_map_test_page(
+            "terminated-navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        for (event, field) in [
+            ("DOMContentLoaded", "domContentLoadedEventEnd"), ("load", "loadEventEnd"),
+        ] {
+            let html = format!("<script>window.addEventListener('{event}',()=>{{globalThis.entered=true;while(true){{}}}});</script>");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+            page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+            assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.entered === true").unwrap(),
+                serde_json::json!(true), "the {event} handler must actually have started");
+            assert_eq!(page.js.as_mut().unwrap().evaluate(&format!("performance.timing.{field}")).unwrap().as_f64(),
+                Some(0.0), "the terminated {event} handler never completed");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn preload_dynamic_script_delays_load_but_not_dom_content_loaded() {
         let (base, requests) = spawn_delayed_classic_script_server(
             std::time::Duration::from_millis(150),
@@ -7545,6 +7835,31 @@ mod tests {
                 .unwrap(),
             serde_json::json!([1, 1, true]),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_discovery_bounds_a_microtask_storm() {
+        let mut page = import_map_test_page(
+            "frame-discovery-microtasks",
+            "https://example.test/",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        page.js.as_mut().unwrap().execute_script(
+            "frame-discovery-busy-task",
+            "setTimeout(() => {\
+               const end = Date.now() + 7000;\
+               const spin = () => { if (Date.now() < end) Promise.resolve().then(spin); };\
+               spin();\
+             }, 0);",
+        ).unwrap();
+
+        let started = std::time::Instant::now();
+        page.build_document_frames().await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(6500),
+            "frame discovery must bound synchronous microtasks, not rely on a Tokio timeout: {:?}",
+            started.elapsed());
+        assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0),
+            "the page must remain usable after an overrun");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8044,9 +8359,20 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 2048];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let first = String::from_utf8_lossy(&request[..read])
+                        // Accepted sockets can inherit the listener's nonblocking
+                        // mode. Consume the complete request before responding,
+                        // including fragmented headers.
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let size = stream.read(&mut chunk).unwrap();
+                            assert_ne!(size, 0, "request closed before its headers completed");
+                            request.extend_from_slice(&chunk[..size]);
+                            assert!(request.len() <= 16_384, "fixture request headers too large");
+                        }
+                        let first = String::from_utf8_lossy(&request)
                             .lines()
                             .next()
                             .unwrap_or_default()
@@ -8981,10 +9307,22 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let served = served.clone();
                         std::thread::spawn(move || {
-                            let mut request = [0u8; 2048];
-                            let _ = stream.read(&mut request);
+                            // Accepted sockets can inherit the listener's nonblocking
+                            // mode. Consume the complete request before responding or
+                            // signalling A's readiness, including fragmented headers.
+                            stream.set_nonblocking(false).unwrap();
+                            stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                            let mut request = Vec::new();
+                            let mut chunk = [0u8; 2048];
+                            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                                let size = stream.read(&mut chunk).unwrap();
+                                assert_ne!(size, 0, "request closed before its headers completed");
+                                request.extend_from_slice(&chunk[..size]);
+                                assert!(request.len() <= 16_384, "fixture request headers too large");
+                            }
+                            let index = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let width = if index == 0 {
                                 std::thread::sleep(std::time::Duration::from_millis(1_500));
                                 20

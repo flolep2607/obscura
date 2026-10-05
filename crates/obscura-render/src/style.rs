@@ -424,7 +424,9 @@ pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
-        if name == "animation" || name.starts_with("animation-") {
+        // display:none determines whether a CSS animation can exist, even
+        // when an important declaration overrides the normal display value.
+        if name == "display" || name == "animation" || name.starts_with("animation-") {
             apply_value(style, &name, value.trim());
         }
     }
@@ -7032,17 +7034,17 @@ fn valid_counter_name(name: &str) -> bool {
             .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '"' | '\''))
 }
 
-/// Absolute keyword font-sizes (the `medium`-anchored scale), for the handful
-/// of pages that still use them.
+/// Absolute keyword font-sizes using the default 16px medium scale.
 fn font_size_keyword(v: &str) -> Option<f32> {
     Some(match v.to_ascii_lowercase().as_str() {
-        "xx-small" => 9.6,
-        "x-small" => 12.0,
-        "small" => 13.3,
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
         "medium" => 16.0,
         "large" => 18.0,
         "x-large" => 24.0,
         "xx-large" => 32.0,
+        "xxx-large" => 48.0,
         _ => return None,
     })
 }
@@ -7222,6 +7224,22 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
 /// the required size so modern design-system declarations reach the size,
 /// line-height, weight, style, and family fields that affect our layout.
 fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") {
+        // All modeled font longhands are inherited. Clear earlier declarations,
+        // including native-control UA defaults, before the top-down pass.
+        style.font_size = None;
+        style.font_size_raw = None;
+        style.font_size_expression = None;
+        style.font_family = None;
+        style.font_weight = None;
+        style.font_style_italic = None;
+        style.font_optical_sizing = None;
+        style.font_variation_settings = None;
+        style.line_height = None;
+        style.line_height_expression = None;
+        return;
+    }
     let tokens = split_ws_paren(value);
     let Some((size_index, size, attached_line_height)) =
         tokens.iter().enumerate().find_map(|(index, token)| {

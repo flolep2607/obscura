@@ -102,6 +102,18 @@ pub async fn handle(
     session_id: &Option<String>,
 ) -> Result<Value, String> {
     match method {
+        "getHeapUsage" => {
+            let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            let js = page.js.as_mut().ok_or("No JavaScript runtime")?;
+            let stats = js.heap_statistics();
+            Ok(json!({
+                "usedSize": stats.used_heap_size(),
+                "totalSize": stats.total_heap_size(),
+                // Rust-owned DOM storage is not a V8 cppgc heap.
+                "embedderHeapUsedSize": 0,
+                "backingStorageSize": stats.external_memory(),
+            }))
+        }
         "enable" => {
             // puppeteer-extra's FrameManager.initialize calls Runtime.enable on
             // the browser-level connection BEFORE any page target exists. Real
@@ -576,6 +588,32 @@ fn remote_object_from_info(info: &RemoteObjectInfo) -> Value {
 mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_usage_reports_live_v8_allocations_without_running_page_tasks() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("heap-usage".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let before = handle("getHeapUsage", &json!({}), &mut ctx, &session).await.unwrap();
+        for field in ["usedSize", "totalSize", "embedderHeapUsedSize", "backingStorageSize"] {
+            assert!(before[field].as_u64().is_some(), "missing byte count: {before}");
+        }
+        assert!(before["usedSize"].as_u64().unwrap() > 0);
+        assert!(before["totalSize"].as_u64().unwrap() >= before["usedSize"].as_u64().unwrap());
+        ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().execute_script("heap-allocations",
+            "globalThis.heapObjects = Array.from({length: 100000}, (_, i) => ({i}));\
+             globalThis.heapBuffer = new ArrayBuffer(8 * 1024 * 1024);\
+             globalThis.heapTimerRan = false;\
+             setTimeout(() => { globalThis.heapTimerRan = true; }, 0);",
+        ).unwrap();
+        let after = handle("getHeapUsage", &json!({}), &mut ctx, &session).await.unwrap();
+        assert!(after["usedSize"].as_u64().unwrap() > before["usedSize"].as_u64().unwrap());
+        assert!(after["backingStorageSize"].as_u64().unwrap()
+            >= before["backingStorageSize"].as_u64().unwrap() + 8 * 1024 * 1024);
+        assert_eq!(ctx.get_session_page_mut(&session).unwrap()
+            .evaluate("heapTimerRan"), json!(false));
+    }
 
     // Issue #51 — Runtime.evaluate / callFunctionOn must read and validate
     // contextId. Pre-fix the parameter was silently dropped, so Playwright's

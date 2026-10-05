@@ -835,10 +835,7 @@ pub(crate) async fn pump_screencast_frames(ctx: &mut CdpContext) {
 pub(crate) fn command_can_change_screencast_frame(method: &str) -> bool {
     matches!(
         method,
-        "Page.navigate"
-            | "Page.reload"
-            | "Page.navigateToHistoryEntry"
-            | "Input.dispatchMouseEvent"
+        "Input.dispatchMouseEvent"
             | "Input.dispatchKeyEvent"
             | "Input.dispatchTouchEvent"
             | "Emulation.setDeviceMetricsOverride"
@@ -879,6 +876,7 @@ pub fn emit_navigation_events(
     wait_until: WaitUntil,
     reached_network_idle: bool,
 ) {
+    let event_start = ctx.pending_events.len();
     ctx.current_loader_ids
         .insert(page_id.to_string(), loader_id.to_string());
     ctx.nav_events_emitted.insert(page_id.to_string());
@@ -1018,6 +1016,10 @@ pub fn emit_navigation_events(
                 session_id: es.clone(),
             });
         }
+        if let Some(error_text) = &net_event.error_text {
+            ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
+            continue;
+        }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
@@ -1030,6 +1032,16 @@ pub fn emit_navigation_events(
         });
     }
 
+    // A recorder can stop as soon as navigation completes. Give the new
+    // document a compositor opportunity before publishing that boundary,
+    // through the normal sampling and bounded acknowledgement window.
+    #[cfg(feature = "render")]
+    if session_id.as_ref().is_some_and(|id| ctx.screencasts.contains_key(id)) {
+        schedule_screencast_frame(ctx, session_id);
+        if let Err(error) = queue_screencast_frame(ctx, session_id, false) {
+            tracing::warn!("could not produce navigation screencast frame: {error}");
+        }
+    }
     let mut phase3 = vec![
         CdpEvent {
             method: "Page.lifecycleEvent".into(),
@@ -1086,6 +1098,50 @@ pub fn emit_navigation_events(
             }
         }),
     ));
+    fan_out_network_events(ctx, page_id, session_id, event_start);
+}
+
+/// Additional sessions observing the same target. Fetch pauses and lifecycle
+/// ownership stay with the existing driving session.
+pub(crate) fn network_observer_sessions(
+    ctx: &CdpContext,
+    page_id: &str,
+    source: &Option<String>,
+) -> Vec<String> {
+    let mut observers = ctx.sessions.iter()
+        .filter(|(session, page)| page.as_str() == page_id && source.as_ref() != Some(*session))
+        .map(|(session, _)| session.clone())
+        .collect::<Vec<_>>();
+    observers.sort_unstable();
+    observers
+}
+
+fn fan_out_network_events(
+    ctx: &mut CdpContext,
+    page_id: &str,
+    source: &Option<String>,
+    event_start: usize,
+) {
+    let observers = network_observer_sessions(ctx, page_id, source);
+    if observers.is_empty() {
+        return;
+    }
+    let event_end = ctx.pending_events.len();
+    for observer in observers {
+        for index in event_start..event_end {
+            let event = &ctx.pending_events[index];
+            if matches!(event.method.as_str(),
+                "Network.requestWillBeSent" | "Network.responseReceived" | "Network.loadingFinished" | "Network.loadingFailed")
+            {
+                let copy = CdpEvent {
+                    method: event.method.clone(),
+                    params: event.params.clone(),
+                    session_id: Some(observer.clone()),
+                };
+                ctx.pending_events.push(copy);
+            }
+        }
+    }
 }
 
 pub(crate) fn emit_same_document_navigation(
@@ -1119,6 +1175,7 @@ pub(crate) fn emit_runtime_network_events(
     if network_events.is_empty() {
         return;
     }
+    let event_start = ctx.pending_events.len();
     let loader_id = ctx
         .current_loader_ids
         .get(page_id)
@@ -1146,6 +1203,10 @@ pub(crate) fn emit_runtime_network_events(
                 }),
                 session_id: session_id.clone(),
             });
+        }
+        if let Some(error_text) = &network_event.error_text {
+            ctx.pending_events.push(network_loading_failed(network_event, request_id, session_id.clone(), error_text));
+            continue;
         }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
@@ -1177,6 +1238,20 @@ pub(crate) fn emit_runtime_network_events(
             }),
             session_id: session_id.clone(),
         });
+    }
+    fan_out_network_events(ctx, page_id, session_id, event_start);
+}
+
+fn network_loading_failed(
+    event: &obscura_browser::NetworkEvent, request_id: &str,
+    session_id: Option<String>, error_text: &str,
+) -> CdpEvent {
+    CdpEvent {
+        method: "Network.loadingFailed".into(),
+        params: json!({"requestId": request_id, "timestamp": event.timestamp,
+            "type": event.resource_type, "errorText": error_text,
+            "canceled": error_text == "net::ERR_ABORTED"}),
+        session_id,
     }
 }
 
@@ -1865,6 +1940,112 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
+    fn observer_fixture() -> (CdpContext, String, Option<String>, Vec<obscura_browser::NetworkEvent>) {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let unrelated_page = ctx.create_page();
+        let driver = Some("driver".to_string());
+        for (session, target) in [("driver", &page), ("observer-a", &page), ("observer-b", &page), ("unrelated", &unrelated_page)] {
+            ctx.sessions.insert(session.into(), target.clone());
+        }
+        let events = [("document-internal", "Document", "https://example.test/", 200),
+            ("script-1", "Script", "https://example.test/app.js", 404)]
+            .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
+                request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
+                resource_type: kind.into(), status, headers: Default::default(),
+                response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
+                error_text: None,
+            }).collect();
+        (ctx, page, driver, events)
+    }
+
+    fn assert_observer_network(ctx: &CdpContext) {
+        let network = |session: &str| ctx.pending_events.iter()
+            .filter(|event| event.session_id.as_deref() == Some(session) && event.method.starts_with("Network."))
+            .map(|event| (&event.method, &event.params)).collect::<Vec<_>>();
+        let driver = network("driver");
+        assert!(!driver.is_empty());
+        assert_eq!(network("observer-a"), driver);
+        assert_eq!(network("observer-b"), driver);
+        assert!(network("unrelated").is_empty());
+        assert!(ctx.pending_events.iter().filter(|event| event.session_id.as_deref().is_some_and(|id| id.starts_with("observer")))
+            .all(|event| event.method.starts_with("Network.")), "observers must not receive driving-session lifecycle or Fetch pauses");
+    }
+
+    #[test]
+    fn navigation_network_events_reach_all_target_observers_with_identical_ids() {
+        let (mut ctx, page, driver, events) = observer_fixture();
+        ctx.fetch_intercept.enabled = true;
+        emit_navigation_events(&mut ctx, &driver, "frame-1", "loader-1", "https://example.test/",
+            &page, &events, WaitUntil::Load, false);
+        assert_observer_network(&ctx);
+        let observer = ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).collect::<Vec<_>>();
+        assert_eq!(observer.len(), 6);
+        assert_eq!(observer[0].params["requestId"], "loader-1");
+        assert_eq!(observer[1].params["requestId"], "loader-1");
+        assert_eq!(observer[4].params["response"]["status"], 404);
+    }
+
+    #[test]
+    fn live_network_events_reach_observers_once_without_replaying_old_events() {
+        let (mut ctx, page, driver, events) = observer_fixture();
+        ctx.pending_events.push(CdpEvent { method: "Network.loadingFinished".into(), params: json!({"requestId":"old"}), session_id: driver.clone() });
+        let old = ctx.pending_events.remove(0);
+        emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events);
+        assert_observer_network(&ctx);
+        assert_eq!(ctx.pending_events.len(), 18);
+        // Existing queued events must not be copied with the next batch.
+        ctx.pending_events.insert(0, old);
+        let start = ctx.pending_events.len();
+        emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[1..]);
+        assert_eq!(ctx.pending_events.len() - start, 9);
+        assert!(ctx.pending_events[start..].iter().all(|event| event.params["requestId"] == "script-1"));
+    }
+
+    #[test]
+    fn failed_network_events_reach_observers_once_with_original_request_identity() {
+        let (mut ctx, page, driver, mut events) = observer_fixture();
+        events[1].status = 0;
+        events[1].error_text = Some("net::ERR_ABORTED".into());
+        for navigation in [false, true] {
+            for intercepted in [false, true] {
+                ctx.pending_events.clear();
+                events[1].intercepted = intercepted;
+                if navigation {
+                    emit_navigation_events(&mut ctx, &driver, "frame-1", "loader-1", "https://example.test/",
+                        &page, &events[1..], WaitUntil::Load, false);
+                } else {
+                    emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[1..]);
+                }
+                assert_observer_network(&ctx);
+                for session in ["driver", "observer-a", "observer-b"] {
+                    let network = ctx.pending_events.iter().filter(|event|
+                        event.session_id.as_deref() == Some(session) && event.method.starts_with("Network.")
+                    ).collect::<Vec<_>>();
+                    assert_eq!(network.len(), if intercepted { 1 } else { 2 });
+                    let failure = network.last().unwrap();
+                    assert_eq!(failure.method, "Network.loadingFailed");
+                    assert_eq!(failure.params["requestId"], "script-1");
+                    assert_eq!(failure.params["errorText"], "net::ERR_ABORTED");
+                    assert_eq!(failure.params["type"], "Script");
+                    assert_eq!(failure.params["canceled"], true);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detached_observers_stop_receiving_intercepted_response_events() {
+        let (mut ctx, page, driver, mut events) = observer_fixture();
+        ctx.sessions.remove("observer-b");
+        events[0].intercepted = true;
+        emit_runtime_network_events(&mut ctx, &driver, "frame-1", "https://example.test/", &page, &events[..1]);
+        assert_eq!(ctx.pending_events.len(), 4);
+        assert!(ctx.pending_events.iter().all(|event| event.method != "Network.requestWillBeSent"));
+        assert_eq!(ctx.pending_events.iter().filter(|event| event.session_id.as_deref() == Some("observer-a")).count(), 2);
+        assert!(!ctx.pending_events.iter().any(|event| event.session_id.as_deref() == Some("observer-b")));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn immediate_preload_runs_in_existing_frames_and_remains_removable() {
         let mut ctx = CdpContext::new();
@@ -2063,6 +2244,7 @@ mod tests {
             )])),
             body_size: 12,
             timestamp: 42.0,
+            error_text: None,
         };
 
         emit_runtime_network_events(
@@ -2103,7 +2285,7 @@ mod tests {
         ctx.fetch_intercept.enabled = true;
         emit_navigation_events(
             &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
-            &page_id, &[event], WaitUntil::Load, true,
+            &page_id, std::slice::from_ref(&event), WaitUntil::Load, true,
         );
         let network = ctx.pending_events.iter().filter(|e|
             e.method.starts_with("Network.") || e.method.starts_with("Fetch.")
@@ -2111,6 +2293,28 @@ mod tests {
         assert_eq!(network.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
             ["Network.responseReceived", "Network.loadingFinished"]);
         assert!(network.iter().all(|e| e.params["requestId"] == "fetch-7"));
+
+        let failed = obscura_browser::NetworkEvent {
+            intercepted: false, status: 0, error_text: Some("net::ERR_ABORTED".into()), ..event
+        };
+        ctx.pending_events.clear();
+        emit_runtime_network_events(
+            &mut ctx, &session_id, "frame-1", "https://example.test/", &page_id,
+            std::slice::from_ref(&failed),
+        );
+        assert_eq!(ctx.pending_events.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.requestWillBeSent", "Network.loadingFailed"]);
+        assert_eq!(ctx.pending_events[1].params["requestId"], "fetch-7");
+        assert_eq!(ctx.pending_events[1].params["errorText"], "net::ERR_ABORTED");
+        assert_eq!(ctx.pending_events[1].params["canceled"], true);
+        ctx.pending_events.clear();
+        emit_navigation_events(
+            &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
+            &page_id, &[failed], WaitUntil::Load, true,
+        );
+        assert_eq!(ctx.pending_events.iter().filter(|e| e.method.starts_with("Network."))
+            .map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.requestWillBeSent", "Network.loadingFailed"]);
     }
 
     #[test]
@@ -2133,6 +2337,7 @@ mod tests {
             response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
             body_size: 0,
             timestamp: 42.0,
+            error_text: None,
         };
 
         emit_navigation_events(
