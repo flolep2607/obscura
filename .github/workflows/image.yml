@@ -27,6 +27,13 @@ jobs:
         include:
           - flavor: stealth
             features: stealth
+          # Same build with the default HTTP client accepting invalid
+          # certificates, for deployments that must reach misconfigured sites.
+          # Not for general use: it disables TLS verification on that client.
+          - flavor: stealth-insecure-tls
+            features: stealth
+            cache: stealth
+            insecure_tls: true
           - flavor: render-stealth
             features: render,stealth
           - flavor: plain
@@ -50,7 +57,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: image-${{ matrix.flavor }}
+          shared-key: image-${{ matrix.cache || matrix.flavor }}
+
+      - name: Accept invalid certificates
+        if: matrix.insecure_tls
+        run: |
+          grep -q 'danger_accept_invalid_certs(false)' crates/obscura-net/src/client.rs
+          sed -i 's/danger_accept_invalid_certs(false)/danger_accept_invalid_certs(true)/' crates/obscura-net/src/client.rs
 
       - name: Build
         env:
