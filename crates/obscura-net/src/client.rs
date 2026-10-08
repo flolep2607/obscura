@@ -854,7 +854,7 @@ async fn read_reqwest_body_limited(
         .min(limit);
     let mut body = Vec::with_capacity(capacity);
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error))
+        ObscuraNetError::Network(format!("Failed to read body: {}", error_chain(&error)))
     })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
@@ -1615,7 +1615,7 @@ impl ObscuraHttpClient {
             )
             .await
             .map_err(|e| {
-                ObscuraNetError::Network(format!("{}: {}", current_url, e))
+                ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
             })?;
 
             let status = resp.status();
@@ -1719,6 +1719,25 @@ impl Default for ObscuraHttpClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `error` followed by the message of each error in its `source()` chain, joined
+/// with ": ". reqwest and wreq only say "error sending request" at the top level;
+/// the cause (expired certificate, handshake failure, refused connection, DNS)
+/// is further down the chain.
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers already include their source's message in their own.
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2938,7 +2957,38 @@ mod ssrf_tests {
         let client =
             ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
         let url = Url::parse(&format!("https://127.0.0.1:{port}/")).unwrap();
-        assert!(client.fetch(&url).await.is_err(), "unknown CA must be rejected");
+        let error = client.fetch(&url).await.expect_err("unknown CA must be rejected");
+        // The message must carry the TLS cause, not only "error sending request".
+        let message = error.to_string();
+        assert!(message.contains("invalid peer certificate"), "{message}");
+    }
+
+    #[test]
+    fn error_chain_appends_each_source_once() {
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl fmt::Display for Layer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|e| e as _)
+            }
+        }
+
+        let leaf = Layer("certificate expired", None);
+        // The middle layer already quotes the leaf, so the leaf is not repeated.
+        let middle = Layer("tls: certificate expired", Some(Box::new(leaf)));
+        let top = Layer("error sending request", Some(Box::new(middle)));
+        assert_eq!(
+            super::error_chain(&top),
+            "error sending request: tls: certificate expired"
+        );
+        assert_eq!(super::error_chain(&Layer("alone", None)), "alone");
     }
 }
 
