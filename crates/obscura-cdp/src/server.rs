@@ -768,16 +768,24 @@ fn release_idle_connection_memory() {
 /// zero connections) still returns the closed connection's free heap pages
 /// instead of holding its peak RSS for days.
 fn release_connection_memory(idle: bool) {
-    const BUSY_TRIM_INTERVAL_MS: u64 = 5_000;
     static LAST_TRIM_MS: AtomicU64 = AtomicU64::new(0);
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
-    let last = LAST_TRIM_MS.load(Ordering::Relaxed);
-    if !idle && last != 0 && now.saturating_sub(last) < BUSY_TRIM_INTERVAL_MS {
-        return;
+    if claim_connection_memory_trim(&LAST_TRIM_MS, now, idle) {
+        release_idle_connection_memory();
     }
-    LAST_TRIM_MS.store(now, Ordering::Relaxed);
-    release_idle_connection_memory();
+}
+
+fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> bool {
+    const BUSY_TRIM_INTERVAL_MS: u64 = 5_000;
+    // Claim the interval atomically; a delayed closer cannot roll its timestamp back.
+    last_trim.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+        if idle || last == 0 || now.saturating_sub(last) >= BUSY_TRIM_INTERVAL_MS {
+            Some(now.max(last))
+        } else {
+            None
+        }
+    }).is_ok()
 }
 
 /// Run each connection's `cdp_processor` (with its own `CdpContext` and pages)
@@ -2303,6 +2311,46 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn connection_memory_trim_preserves_interval_and_idle_behavior() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let last = AtomicU64::new(0);
+        for (now, idle, expected, timestamp) in [
+            (100, false, true, 100),
+            (100, false, false, 100),
+            (5_099, false, false, 100),
+            (5_100, false, true, 5_100),
+            (5_101, true, true, 5_101),
+            (100, true, true, 5_101),
+            (5_102, false, false, 5_101),
+        ] {
+            assert_eq!(super::claim_connection_memory_trim(&last, now, idle), expected);
+            assert_eq!(last.load(Ordering::Relaxed), timestamp);
+        }
+    }
+
+    #[test]
+    fn busy_connection_memory_trim_has_one_winner_per_interval() {
+        use std::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}, Barrier};
+        let last = AtomicU64::new(0);
+        let winners = AtomicUsize::new(0);
+        let barrier = Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    for round in 1..=2_000 {
+                        barrier.wait();
+                        if super::claim_connection_memory_trim(&last, round * 5_000, false) {
+                            winners.fetch_add(1, Ordering::Relaxed);
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(Ordering::Relaxed), 2_000);
+    }
 
     #[test]
     fn intercepted_request_is_observable_without_sharing_fetch_control() {
