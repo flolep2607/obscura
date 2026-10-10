@@ -112,6 +112,7 @@ Run obscura as an MCP server.
 
 ```
     --http                   HTTP transport instead of stdio
+    --font-dir <DIR>         Load additional fonts before rendering (repeatable; render build)
     --host <HOST>            HTTP bind host (default 127.0.0.1)
     --port <PORT>            HTTP port (default 3000)
     --proxy <URL>            HTTP or SOCKS5 proxy
