@@ -5845,6 +5845,8 @@ class Document extends Node {
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
+    const get = _documentRealmMember(this, 'contentType');
+    if (get) return Reflect.apply(get, this, []);
     // An explicit type set by DOMParser/createDocument wins.
     if (this._contentType) return this._contentType;
     // `new Document()` (the WHATWG constructor, no backing node id) creates an
@@ -17241,7 +17243,7 @@ function _installCaretGeometry() {
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),

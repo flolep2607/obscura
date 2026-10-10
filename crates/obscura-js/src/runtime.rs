@@ -4550,6 +4550,16 @@ mod tests {
     }
 
     #[test]
+    fn document_content_type_retains_url_fallback_without_response_metadata() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/document.xhtml");
+        rt.run_page_init();
+        assert_eq!(rt.evaluate("document.contentType").unwrap(),
+            serde_json::json!("application/xhtml+xml"));
+    }
+
+    #[test]
     fn screen_override_clear_before_page_init_preserves_mutable_hidden_slots() {
         let mut rt = ObscuraJsRuntime::new();
         rt.set_screen_size_override(None, false);

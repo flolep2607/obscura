@@ -435,6 +435,23 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_content_type_getter_reads_the_frame_document() {
+        let mut parent = ObscuraJsRuntime::new();
+        parent.set_dom(parse_html("<html><body></body></html>"));
+        parent.set_url("https://parent.example/page");
+        parent.set_content_type("text/plain");
+        parent.run_page_init();
+        let _frame = FrameRealm::new(&mut parent, 1, 0,
+            "https://parent.example/frame", "<html><body>Child</body></html>")
+            .expect("frame realm");
+        assert_eq!(parent.evaluate(r#"(function(){
+            const child = globalThis.__obscura_frameObjects[1].document;
+            const get = Object.getOwnPropertyDescriptor(Document.prototype, 'contentType').get;
+            return [get.call(child), child.contentType, document.contentType];
+        })()"#).unwrap(), serde_json::json!(["text/html", "text/html", "text/plain"]));
+    }
+
+    #[test]
     fn fetched_frame_contexts_survive_runtime_teardown_under_gc_stress() {
         crate::set_v8_flags("--stress-compaction --stress-marking=1");
         for _ in 0..10 {

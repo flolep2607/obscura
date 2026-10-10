@@ -430,7 +430,7 @@ impl ObscuraState {
             about_base_url: None,
             inherited_origin: None,
             encoding: "UTF-8".to_string(),
-            content_type: "text/html".to_string(),
+            content_type: String::new(),
             title: String::new(),
             referrer: String::new(),
             navigation_timing: NavigationTiming::default(),

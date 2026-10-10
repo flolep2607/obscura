@@ -280,7 +280,8 @@ pub struct Page {
     /// encoding override on `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
     /// MIME type of the current document's main resource, lowercased and
-    /// without parameters. Exposed to JS as `document.contentType`.
+    /// without parameters, or empty when no type was supplied.
+    /// Exposed to JS as `document.contentType`.
     pub content_type: String,
     /// Monotonic origin for the current document's CSS animation timeline.
     /// It is reset once author styles are installed, so stylesheet download
@@ -1116,7 +1117,7 @@ impl Page {
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
-            content_type: "text/html".to_string(),
+            content_type: String::new(),
             document_timeline_origin: std::time::Instant::now(),
             navigation_timing: NavigationTiming::default(),
             navigation_timeout: None,
@@ -3513,7 +3514,7 @@ impl Page {
         let (dom, document_content_type) = match plain_text_document_type(response.content_type())
         {
             Some(mime) => (parse_plain_text_document(&body_text), mime),
-            None => (parse_html(&body_text), document_content_type_or_html(response.content_type())),
+            None => (parse_html(&body_text), base_content_type(response.content_type()).unwrap_or_default()),
         };
         self.content_type = document_content_type;
 
@@ -3775,6 +3776,7 @@ impl Page {
             "<html><head></head><body></body></html>",
         ));
         self.title = String::new();
+        self.content_type.clear();
         self.lifecycle = LifecycleState::Loaded;
         self.document_timeline_origin = std::time::Instant::now();
     }
@@ -5722,6 +5724,40 @@ mod tests {
             observed,
             serde_json::json!(["text/plain", "PRE", 1, body])
         );
+    }
+
+    #[test]
+    fn plain_text_document_preserves_leading_newlines_and_literal_markup() {
+        for (text, expected) in [
+            ("\nfirst\nlast", "\nfirst\nlast"),
+            ("\r\nfirst\rsecond", "\nfirst\nsecond"),
+            ("\n\n", "\n\n"),
+            ("<&amp;> </pre><script>bad()</script>", "<&amp;> </pre><script>bad()</script>"),
+        ] {
+            let dom = super::parse_plain_text_document(text);
+            let pre = dom.query_selector("pre").unwrap().unwrap();
+            assert_eq!(dom.text_content(pre), expected, "input {text:?}");
+            assert!(dom.query_selector("script").unwrap().is_none());
+        }
+        let empty = super::parse_plain_text_document("");
+        assert_eq!(empty.text_content(empty.document()), "");
+        assert!(empty.query_selector("pre").unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_text_navigation_resets_content_type_on_about_blank() {
+        let mut page = super::Page::new(
+            "plain-text-blank".to_string(),
+            std::sync::Arc::new(crate::BrowserContext::new("plain-text-blank".to_string())),
+        );
+        page.navigate("data:text/plain,first%0Alast").await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[document.contentType, document.body.textContent]"
+        ).unwrap(), serde_json::json!(["text/plain", "first\nlast"]));
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(
+            "[document.contentType, document.body.textContent]"
+        ).unwrap(), serde_json::json!(["text/html", ""]));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10349,13 +10385,6 @@ fn base_content_type(content_type: Option<&str>) -> Option<String> {
     if ct.is_empty() { None } else { Some(ct) }
 }
 
-/// The MIME type `document.contentType` reports for a main resource. Missing
-/// or empty Content-Type headers stay unset so `contentType` keeps falling
-/// back to URL-derived sniffing.
-fn document_content_type_or_html(content_type: Option<&str>) -> String {
-    base_content_type(content_type).unwrap_or_else(|| "text/html".to_string())
-}
-
 /// A response whose body is text but not markup gets a plain-text document
 /// rather than an HTML parse of its content (`text/plain`, `text/markdown`).
 /// Returns the MIME type to report as `document.contentType`.
@@ -10380,14 +10409,13 @@ fn plain_text_document_type(content_type: Option<&str>) -> Option<String> {
 /// the whole text. Serializing through the HTML parser keeps one code path for
 /// document construction instead of a second native tree builder.
 fn parse_plain_text_document(text: &str) -> DomTree {
-    let mut html = String::with_capacity(text.len() + 64);
-    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title></title></head><body><pre>");
-    html.push_str(&escape_html_text(text));
-    // A newline straight after <pre> is dropped by the HTML parser; an extra
-    // one keeps text that itself starts with a newline.
-    if text.starts_with('\n') {
-        html.push('\n');
+    if text.is_empty() {
+        return parse_html("<!DOCTYPE html>");
     }
+    let mut html = String::with_capacity(text.len() + 64);
+    // The parser discards the synthetic newline, not the document's first one.
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title></title></head><body><pre>\n");
+    html.push_str(&escape_html_text(text));
     html.push_str("</pre></body></html>");
     parse_html(&html)
 }
