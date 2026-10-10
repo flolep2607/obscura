@@ -2427,6 +2427,7 @@ mod tests {
             status: 200,
             headers: std::collections::HashMap::new(),
             response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            error_text: None,
             body_size: 10,
             timestamp: 1.0,
         })
