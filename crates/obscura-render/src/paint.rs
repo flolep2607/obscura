@@ -4925,6 +4925,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 None,
                                 0.0,
+                                0.0,
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -5058,6 +5059,7 @@ fn paint_laid_dom_scrolled(
                     false,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -5097,6 +5099,7 @@ fn paint_laid_dom_scrolled(
                     is_bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     clip,
                     element_clip_mask,
                     raster_scale,
@@ -5123,6 +5126,7 @@ fn paint_laid_dom_scrolled(
                     crate::style::used_font_weight(style) >= 600,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                     Some(visible_rect),
                     element_clip_mask,
                     raster_scale,
@@ -5303,6 +5307,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
+                                style.word_spacing.unwrap_or(0.0),
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -5337,6 +5342,7 @@ fn paint_laid_dom_scrolled(
                                 false,
                                 style.font_family.as_deref(),
                                 style.letter_spacing.unwrap_or(0.0),
+                                style.word_spacing.unwrap_or(0.0),
                                 clip,
                                 element_clip_mask,
                                 raster_scale,
@@ -7288,6 +7294,7 @@ fn paint_text_node(
             is_bold,
             style.font_family.as_deref(),
             style.letter_spacing.unwrap_or(0.0),
+            style.word_spacing.unwrap_or(0.0),
             clip,
             clip_mask.as_ref(),
             raster_scale,
@@ -7373,6 +7380,7 @@ fn draw_text(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
     clip: Option<crate::Rect>,
     clip_mask: Option<&tiny_skia::Mask>,
     raster_scale: f32,
@@ -7479,11 +7487,13 @@ fn draw_text(
             // each word is its own independently-positioned box.
             caret.x += scaled_font.h_advance(id)
                 + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale;
+                + letter_spacing * raster_scale
+                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         } else {
             caret.x += scaled_font.h_advance(id)
                 + if is_bold { raster_scale } else { 0.0 }
-                + letter_spacing * raster_scale;
+                + letter_spacing * raster_scale
+                + if matches!(c, ' ' | '\u{00a0}') { word_spacing * raster_scale } else { 0.0 };
         }
     }
 }
@@ -16541,6 +16551,25 @@ mod tests {
         assert_eq!(computed["translate"], "7px 0px");
         assert_eq!(computed["rotate"], "30deg");
         assert_eq!(computed["scale"], "2 2");
+    }
+
+    #[test]
+    fn non_replaced_inline_ignores_transform_for_geometry() {
+        let tree = parse_html(
+            r#"<html><body style="margin:0">
+              <span id="inline" style="transform:translateX(50px)">abc</span>
+              <span id="atomic" style="display:inline-block;transform:translateX(50px)">abc</span>
+            </body></html>"#,
+        );
+        let mut resources = RenderResourceCache::default();
+        let prepared = prepare_dom(&tree, (300.0, 100.0), None, &mut resources)
+            .expect("prepared inline transform geometry");
+        let inline = tree.get_element_by_id("inline").unwrap();
+        let atomic = tree.get_element_by_id("atomic").unwrap();
+
+        assert!(prepared.layout().transforms.get(&inline).is_none());
+        assert!(prepared.layout().transforms.get(&atomic).is_some());
+        assert!(prepared.document_rect(atomic).unwrap().x >= 50.0);
     }
 
     #[test]
