@@ -7,6 +7,146 @@ use obscura_dom::tree_sink::parse_html;
 use obscura_render::{layout_dom, layout_dom_with_images};
 use std::collections::HashMap;
 
+#[test]
+fn word_spacing_changes_intrinsic_width() {
+    let tree = parse_html(r#"<style>
+        span { display:inline-block; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        </style><span id="normal">A B C</span><span id="spaced">A B C</span>"#);
+    let layout = layout_dom(&tree, (600.0, 200.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    assert!((width("spaced") - width("normal") - 60.0).abs() < 0.1);
+}
+
+#[test]
+fn word_spacing_rejects_invalid_and_unsupported_lengths() {
+    for value in ["bogus", "30", "10%", "3 px", "min(30px,bogus)", "calc(30px) bogus",
+        "calc(30)", "calc(2px * 3px)", "min(1px,max(2px,bogus))", "1px 2px", "1e99px"]
+    {
+        let tree = parse_html(&format!("<div id='copy' style='word-spacing:3px;word-spacing:{value}'>A B</div>"));
+        let layout = layout_dom(&tree, (400.0, 200.0));
+        assert_eq!(layout.styles[&tree.get_element_by_id("copy").unwrap()].word_spacing, Some(3.0), "{value}");
+        assert!(!obscura_render::style::supports_declaration("word-spacing", value), "{value}");
+    }
+    for value in ["normal", "0", "-3px", ".75em", "2rem"] {
+        assert!(obscura_render::style::supports_declaration("word-spacing", value), "{value}");
+    }
+}
+
+#[test]
+fn word_spacing_resolves_before_inheritance_and_preserves_cascade() {
+    let tree = parse_html(r#"<style>
+        section { font-size:20px; word-spacing:1.5em }
+        span { display:inline-block; font-size:40px; white-space:nowrap }
+        #normal { word-spacing:normal }
+        #inherit { word-spacing:3px; word-spacing:inherit }
+        #unset { word-spacing:3px; word-spacing:unset }
+        #invalid { word-spacing:3px; word-spacing:bogus; word-spacing:calc(bogus) }
+        #negative { word-spacing:-.25em }
+        #revert { word-spacing:3px; word-spacing:revert }
+        </style><section>
+        <span id="inherited">A B C</span><span id="normal">A B C</span>
+        <span id="inherit">A B C</span><span id="unset">A B C</span>
+        <span id="invalid">A B C</span><span id="negative">A B C</span>
+        <span id="revert">A B C</span></section>"#);
+    let layout = layout_dom(&tree, (1800.0, 300.0));
+    let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+    for (id, spacing) in [("inherited", 30.0), ("normal", 0.0), ("inherit", 30.0),
+        ("unset", 30.0), ("invalid", 3.0), ("negative", -10.0), ("revert", 30.0)]
+    {
+        assert_eq!(layout.styles[&tree.get_element_by_id(id).unwrap()].word_spacing, Some(spacing), "{id}");
+        assert!((width(id) - width("normal") - 2.0 * spacing).abs() <= 1.0, "{id}");
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_changes_wrapping_and_native_control_widths() {
+    let tree = parse_html(r#"<style>
+        div { width:140px; font:40px/60px monospace }
+        .spaced { word-spacing:30px }
+        button, select { font:40px/60px monospace }
+        </style><div id="normal">A B C</div><div id="spaced" class="spaced">A B C</div>
+        <button id="button">A B C</button><button id="button-spaced" class="spaced">A B C</button>
+        <select id="select"><option>A B C</option></select>
+        <select id="select-spaced" class="spaced"><option>A B C</option></select>"#);
+    let layout = layout_dom(&tree, (1000.0, 500.0));
+    let rect = |id| layout.rects[&tree.get_element_by_id(id).unwrap()];
+    assert_eq!(rect("normal").height, 60.0);
+    assert_eq!(rect("spaced").height, 120.0);
+    for (normal, spaced) in [("button", "button-spaced"), ("select", "select-spaced")] {
+        assert!((rect(spaced).width - rect(normal).width - 60.0).abs() <= 1.0,
+            "{normal}: {:?} -> {:?}", rect(normal), rect(spaced));
+    }
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_handles_whitespace_nested_spans_and_generated_content() {
+    for (content, extra_css, delta) in [
+        ("  A   B  C  ", "", 60.0),
+        ("A&nbsp;B&nbsp;C", "", 60.0),
+        ("A  B", "white-space:pre", 60.0),
+        ("A\tB", "white-space:pre", 0.0),
+        ("A B C", "letter-spacing:2px", 60.0),
+        ("A<span> B</span> C", "", 60.0),
+        ("אב גד", "direction:rtl", 30.0),
+    ] {
+        let tree = parse_html(&format!(r#"<style>
+            div {{ display:inline-block; font:40px/60px monospace; white-space:nowrap; {extra_css} }}
+            #spaced {{ word-spacing:30px }}
+            </style><div id="normal">{content}</div><div id="spaced">{content}</div>"#));
+        let layout = layout_dom(&tree, (1000.0, 300.0));
+        let width = |id| layout.rects[&tree.get_element_by_id(id).unwrap()].width;
+        assert!((width("spaced") - width("normal") - delta).abs() <= 1.0, "{content:?}, {extra_css}");
+    }
+    let tree = parse_html(r#"<style>
+        div { display:inline-block; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        div::before { content:'A B C'; font-size:20px }
+        div::after { content:'A B C'; word-spacing:normal }
+        </style><div id="normal"></div><div id="spaced"></div>"#);
+    let layout = layout_dom(&tree, (1000.0, 300.0));
+    let id = tree.get_element_by_id("spaced").unwrap();
+    assert_eq!(layout.styles[&id].before_pseudo.as_ref().unwrap().word_spacing, Some(30.0));
+    assert_eq!(layout.styles[&id].after_pseudo.as_ref().unwrap().word_spacing, Some(0.0));
+    let normal = layout.rects[&tree.get_element_by_id("normal").unwrap()].width;
+    assert!((layout.rects[&id].width - normal - 60.0).abs() <= 1.0);
+}
+
+#[cfg(feature = "paint")]
+#[test]
+fn word_spacing_moves_painted_glyphs() {
+    let tree = parse_html(r#"<style>
+        body { margin:0; background:white; color:black }
+        div { height:80px; font:40px/60px monospace; white-space:nowrap }
+        #spaced { word-spacing:30px }
+        </style><div>A B C</div><div id="spaced">A B C</div>"#);
+    let png = obscura_render::screenshot_png(&tree, (400.0, 180.0), None).unwrap();
+    let pixmap = tiny_skia::Pixmap::decode_png(&png).unwrap();
+    let starts = |top: usize| {
+        let mut result = Vec::new();
+        let mut previous = false;
+        for x in 0..400 {
+            let ink = (top..top + 70).any(|y| {
+                let pixel = pixmap.pixels()[y * 400 + x];
+                pixel.red() < 128 && pixel.green() < 128 && pixel.blue() < 128
+            });
+            if ink && !previous { result.push(x as i32); }
+            previous = ink;
+        }
+        result
+    };
+    let normal = starts(0);
+    let spaced = starts(80);
+    assert_eq!(normal.len(), 3, "normal glyph columns: {normal:?}");
+    assert_eq!(spaced.len(), 3, "spaced glyph columns: {spaced:?}");
+    for i in 0..3 {
+        assert!((spaced[i] - normal[i] - i as i32 * 30).abs() <= 1,
+            "painted positions: {normal:?} -> {spaced:?}");
+    }
+}
+
 const HN_HTML: &str = r##"
     <table border="0" cellpadding="0" cellspacing="0" width="85%" bgcolor="#f6f6ef">
         <tr>
@@ -33,6 +173,40 @@ const HN_HTML: &str = r##"
         </tr>
     </table>
 "##;
+
+#[cfg(feature = "paint")]
+#[test]
+fn mixed_content_shaped_runs_retain_inline_owner_geometry() {
+    for content in ["ABCD", "AB<b id='nested'>CD</b>"] {
+        let tree = parse_html(&format!(
+            "<style>body{{margin:0;font:20px/24px monospace}}</style>\
+             <div id='parent'>AAAA<div style='height:30px'></div>\
+             <span id='owner'>{content}</span></div>"));
+        let layout = layout_dom(&tree, (200.0, 200.0));
+        let owner = tree.get_element_by_id("owner").unwrap();
+        let rect = layout.rects.get(&owner).expect("shaped inline owner has geometry");
+        assert!(rect.x.abs() < 0.01 && (52.0..=57.0).contains(&rect.y)
+            && (40.0..=55.0).contains(&rect.width) && (18.0..=26.0).contains(&rect.height),
+            "inline following a 24px line and 30px block: {rect:?}");
+        let pieces = layout.inline_fragments.get(&owner).expect("canonical inline fragments");
+        assert!(!pieces.is_empty());
+        for piece in pieces {
+            assert!(piece.width > 0.0 && piece.height > 0.0
+                && piece.x >= rect.x && piece.y >= rect.y
+                && piece.x + piece.width <= rect.x + rect.width + 0.01
+                && piece.y + piece.height <= rect.y + rect.height + 0.01,
+                "inline fragments remain within their owner bounds: {piece:?}, {rect:?}");
+        }
+        let parent = tree.get_element_by_id("parent").unwrap();
+        assert!((layout.rects[&parent].height - 78.0).abs() < 0.01,
+            "preserving inline ownership must not add a line or change block flow");
+        if let Some(nested) = tree.get_element_by_id("nested") {
+            let nested = layout.rects.get(&nested).expect("nested inline owner has geometry");
+            assert!((20.0..=28.0).contains(&nested.x) && (20.0..=28.0).contains(&nested.width)
+                && (nested.y - rect.y).abs() < 1.0, "nested text bounds: {nested:?}");
+        }
+    }
+}
 
 /// Top-left of the tightest laid-out element box whose text contains
 /// `needle`. Text geometry is no longer a per-word list: a pure-text
@@ -4424,6 +4598,36 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
 }
 
 #[test]
+fn nested_grid_input_contributes_intrinsic_height_without_preventing_stretch() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:14px Arial; line-height:22px }
+          .outer { display:grid; width:214px; align-items:center }
+          .editor { display:inline-grid; grid-area:1 / 1 / 2 / 3;
+                    grid-template-columns:0 min-content }
+          input { display:block; width:100%; grid-area:1 / 2;
+                  font:inherit; min-width:2px; padding:0; border:0 }
+          .short { grid-template-rows:12px }
+        </style>
+        <div class="outer"><div class="editor" id="auto-editor"><input id="auto-input"></div></div>
+        <div class="outer"><div class="editor short" id="short-editor"><input id="short-input"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (input, editor, height) in [
+        ("auto-input", "auto-editor", 22.0),
+        ("short-input", "short-editor", 12.0),
+    ] {
+        let input_rect = layout.rects[&tree.get_element_by_id(input).unwrap()];
+        let editor_rect = layout.rects[&tree.get_element_by_id(editor).unwrap()];
+        assert_eq!(input_rect.height, height, "{input}");
+        assert_eq!(editor_rect.height, height, "{editor}");
+        assert!(input_rect.width >= 2.0, "{input}");
+    }
+}
+
+#[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(
         r#"
@@ -4483,6 +4687,56 @@ fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     assert!(auto_button.width > 20.0 && auto_button.width < 30.0);
     assert_eq!(auto_button.height, 300.0);
     assert_eq!(auto_button.x + auto_button.width, auto_button_grid.x + auto_button_grid.width);
+}
+
+#[test]
+fn inline_block_percentage_height_uses_definite_block_content_height() {
+    let tree = parse_html(r#"<!doctype html>
+        <style>
+          html, body { margin:0 }
+          .switch { position:relative; width:32px; height:16px; line-height:1 }
+          input { position:absolute; width:100%; height:100%; margin:0; opacity:0; z-index:-1000 }
+          label { display:inline-block; box-sizing:border-box; width:100%; height:100%; border:1px solid }
+          .padded { height:30px; box-sizing:border-box; padding:4px; border:1px solid }
+          .indefinite { height:auto; min-height:40px }
+        </style>
+        <div class="switch"><input type="checkbox"><label id="percentage"></label></div>
+        <div class="switch"><input type="checkbox"><label id="pixels" style="height:16px"></label></div>
+        <div class="switch padded"><label id="content-box"></label></div>
+        <div class="switch padded"><label id="half" style="height:50%"></label></div>
+        <div class="switch indefinite"><label id="indefinite"></label></div>
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (name, width, height) in [
+        ("percentage", 32.0, 16.0), ("pixels", 32.0, 16.0),
+        ("content-box", 22.0, 20.0), ("half", 22.0, 10.0), ("indefinite", 32.0, 2.0),
+    ] {
+        let rect = layout.rects[&tree.get_element_by_id(name).unwrap()];
+        assert_eq!(rect.width, width, "{name}");
+        assert_eq!(rect.height, height, "{name}");
+    }
+}
+
+#[test]
+fn inherited_font_shorthand_overrides_native_control_typography() {
+    let tree = parse_html(r#"
+        <style>
+          body { font:700 20px/30px Arial }
+          input { display:block; border:0; padding:0 }
+        </style>
+        <input id="inherit" style="font:inherit">
+        <input id="unset" style="font:unset">
+    "#);
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for name in ["inherit", "unset"] {
+        let node = tree.get_element_by_id(name).unwrap();
+        let style = &layout.styles[&node];
+        assert_eq!(style.font_size, Some(20.0), "{name}");
+        assert_eq!(style.line_height, Some(obscura_render::LineHeight::Px(30.0)), "{name}");
+        assert_eq!(style.font_weight.as_deref(), Some("700"), "{name}");
+        assert_eq!(style.font_family.as_deref(), Some("arial"), "{name}");
+        assert_eq!(layout.rects[&node].height, 30.0, "{name}");
+    }
 }
 
 #[test]

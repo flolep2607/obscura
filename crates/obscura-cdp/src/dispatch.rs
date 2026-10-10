@@ -679,6 +679,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.setLifecycleEventsEnabled"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
+            | "Page.setBypassCSP"
             | "Page.getNavigationHistory"
             | "Page.resetNavigationHistory"
             | "Page.captureSnapshot"
@@ -807,6 +808,15 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
         "Accessibility" => {
             domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
+        }
+        "HeapProfiler" if method == "collectGarbage" => {
+            match ctx.get_session_page_mut(&req.session_id).and_then(|page| page.js.as_mut()) {
+                Some(js) => {
+                    js.collect_garbage();
+                    Ok(json!({}))
+                }
+                None => Err("No JavaScript runtime".to_string()),
+            }
         }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
@@ -1199,6 +1209,29 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_profiler_collect_garbage_reclaims_unreferenced_objects() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("heap-gc".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().execute_script("gc-allocations",
+            "globalThis.garbage = Array.from({length: 200000}, (_, i) => ({i}));",
+        ).unwrap();
+        let before = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        ctx.get_session_page_mut(&session).unwrap().evaluate("globalThis.garbage = null");
+        let response = dispatch(&CdpRequest {
+            session_id: session.clone(),
+            ..req("HeapProfiler.collectGarbage")
+        }, &mut ctx).await;
+        assert!(response.error.is_none(), "GC request failed: {:?}", response.error);
+        let after = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        assert!(after + 2 * 1024 * 1024 < before,
+            "explicit GC must reclaim discarded objects: {before} -> {after}");
+    }
+
     #[tokio::test]
     async fn audits_enable_returns_empty_success() {
         let mut ctx = CdpContext::new();
@@ -1206,6 +1239,32 @@ mod tests {
         assert!(
             resp.error.is_none(),
             "Audits.enable should not error: {:?}",
+            resp.error
+        );
+        assert_eq!(resp.result, Some(json!({})));
+    }
+
+    // Playwright sends Page.setBypassCSP for every new page of a context
+    // created with `bypassCSP: true`; an unknown-method error there fails
+    // page creation outright (changedetection.io always sets it).
+    #[tokio::test]
+    async fn page_set_bypass_csp_returns_empty_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("bypass-csp".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let resp = dispatch(
+            &CdpRequest {
+                session_id: session,
+                params: json!({"enabled": true}),
+                ..req("Page.setBypassCSP")
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(
+            resp.error.is_none(),
+            "Page.setBypassCSP should not error: {:?}",
             resp.error
         );
         assert_eq!(resp.result, Some(json!({})));

@@ -121,18 +121,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
     </b>
     Better proxies. Fewer blocks. More scalable automation.
   </td>
-</tr>
-   </tr>
-    <td width="200" align="center" valign="middle">
-      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura" target="_blank">
-        <img alt="NiuProxy" src="assets/sponsors/niuproxlogo.png" width="180"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://niuproxy.com/?utm_source=obscura&utm_medium=obscura&ref=obscura"><b>NiuProxy</b></a> Rotating Residential Proxies — Special Offer: 10TB at $0.35/GB | 1TB at $0.50/GB.<br><br>
-      🎁 Use code <b>PAY2</b> for <b>10% off</b> your recharge.
-    </td>  
-</tr>
     <tr>
     <td width="200" align="center" valign="middle">
       <a href="https://masklabs.io" target="_blank">
@@ -486,6 +474,11 @@ Start a CDP WebSocket server.
 | `--workers` | `1` | Number of parallel worker processes |
 | `--font-dir` | — | Recursively load fonts once per worker (repeatable; render build) |
 | `--obey-robots` | off | Respect robots.txt |
+
+With multiple workers, exited children are reaped and restarted. New connections
+use ready workers only; if none are ready, the balancer returns HTTP 503. A crash
+still closes that worker's existing sessions, which clients must reconnect.
+Worker errors remain visible on stderr.
 
 ### `obscura fetch <URL>`
 

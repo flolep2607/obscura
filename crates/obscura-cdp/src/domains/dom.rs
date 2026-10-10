@@ -234,12 +234,12 @@ pub async fn handle(
         "scrollIntoViewIfNeeded" => {
             let page = ctx.get_session_page_mut(session_id).ok_or("No page")?;
             let node_id = resolve_node_id(page, params)?;
-            // Obscura has no layout viewport to move, but the JS shim records
-            // this element for the hit testing used by subsequent input events.
+            // Share the DOM shim's nested-scrollport handling. Fully visible
+            // boxes stay put; clipped boxes are centered only where needed.
             let code = format!(
                 "(function() {{ var el = globalThis._wrap && globalThis._wrap({0}); \
-                 if (!el || typeof el.scrollIntoView !== 'function') return false; \
-                 el.scrollIntoView(); return true; }})()",
+                 if (!el || typeof el.scrollIntoViewIfNeeded !== 'function') return false; \
+                 el.scrollIntoViewIfNeeded(); return true; }})()",
                 node_id
             );
             let did_scroll = page.evaluate(&code).as_bool().unwrap_or(false);
@@ -761,6 +761,24 @@ mod tests {
                 .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
             assert_eq!(target_id, json!("target"));
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(feature = "render")]
+    async fn scroll_into_view_if_needed_preserves_visible_positions() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        crate::domains::page::handle("navigate", &json!({
+            "url": "data:text/html,<body style='margin:0;height:1800px'><div style='height:200px'></div><button id=target style='height:40px'>Go</button></body>",
+            "waitUntil": "load"
+        }), &mut ctx, &session).await.unwrap();
+        let node = handle("querySelector", &json!({"selector":"#target"}), &mut ctx, &session).await.unwrap();
+        handle("scrollIntoViewIfNeeded", &json!({"nodeId":node["nodeId"]}), &mut ctx, &session).await.unwrap();
+        let position = ctx.get_session_page_mut(&session).unwrap()
+            .evaluate("[scrollY, document.getElementById('target').getBoundingClientRect().top]");
+        assert_eq!(position, json!([0, 200]));
     }
 
     #[tokio::test(flavor = "current_thread")]

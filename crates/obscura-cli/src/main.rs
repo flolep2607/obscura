@@ -83,7 +83,8 @@ enum Command {
         /// Maximum live CDP connections. Each connection runs on its own OS
         /// thread with its own V8 isolates, so this bounds the server's thread
         /// and memory footprint. Connections beyond the limit are refused with
-        /// a 503 rather than queued.
+        /// a 503 rather than queued. With --workers N the limit applies to each
+        /// worker process, so the server-wide maximum is N times this value.
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
 
@@ -349,6 +350,14 @@ fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("obscura main thread panicked"))?
 }
 
+fn operator_network_error(error: impl std::fmt::Display) -> String {
+    let message = error.to_string();
+    match obscura_net::private_network_error_hint(&message) {
+        Some(hint) => format!("{}\n{}", message, hint),
+        None => message,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -465,6 +474,7 @@ async fn run_cli() -> anyhow::Result<()> {
                     stealth,
                     user_agent,
                     font_dirs,
+                    max_connections,
                 )
                 .await?;
             } else {
@@ -602,6 +612,25 @@ async fn run_cli() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn wait_for_serve_worker(
+    child: &mut tokio::process::Child,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("worker on port {} exited during startup: {}", port, status);
+        }
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => return Ok(()),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 async fn run_multi_worker_serve(
     port: u16,
     host: String,
@@ -610,11 +639,17 @@ async fn run_multi_worker_serve(
     stealth: bool,
     user_agent: Option<String>,
     font_dirs: Vec<std::path::PathBuf>,
+    max_connections: usize,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let exe = std::env::current_exe()?;
+    // Register before spawning workers so an early SIGTERM is not fatal to the
+    // balancer alone and leaves no orphans.
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
     // Claim the public port before starting children so another process cannot
     // take it during worker startup.
     let listener = TcpListener::bind((host.as_str(), port)).await?;
@@ -632,8 +667,12 @@ async fn run_multi_worker_serve(
 
     for (index, (worker_port, reservation)) in reservations.into_iter().enumerate() {
         drop(reservation);
-        let mut cmd = std::process::Command::new(&exe);
+        let mut cmd = TokioCommand::new(&exe);
+        cmd.kill_on_drop(true);
         cmd.arg("serve").arg("--port").arg(worker_port.to_string());
+        // Same limit per worker, not split: connections are not spread evenly,
+        // so a split would refuse clients while other workers have room.
+        cmd.arg("--max-connections").arg(max_connections.to_string());
         // Workers receive the client-facing Host header through the TCP
         // load balancer. Let their CDP security gate accept that public port
         // while it continues to reject foreign hosts and browser origins.
@@ -656,11 +695,11 @@ async fn run_multi_worker_serve(
             cmd.arg("--stealth");
         }
         cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::inherit());
 
         let child = cmd.spawn()?;
         tracing::info!("Worker {} on port {}", index + 1, worker_port);
-        children.push(child);
+        children.push((child, cmd));
         worker_ports.push(worker_port);
     }
 
@@ -668,24 +707,52 @@ async fn run_multi_worker_serve(
     // 500 ms sleep dominated multi-worker startup even when workers were ready
     // in a few milliseconds.
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    for (index, (child, &worker_port)) in children.iter_mut().zip(&worker_ports).enumerate() {
-        loop {
-            if let Some(status) = child.try_wait()? {
-                anyhow::bail!("worker {} exited during startup: {}", index + 1, status);
+    for ((child, _), &worker_port) in children.iter_mut().zip(&worker_ports) {
+        wait_for_serve_worker(child, worker_port, deadline).await?;
+    }
+
+    let mut availability = Vec::with_capacity(workers as usize);
+    let mut supervisors = tokio::task::JoinSet::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+    for ((mut child, mut cmd), &worker_port) in children.into_iter().zip(&worker_ports) {
+        let ready = Arc::new(AtomicBool::new(true));
+        availability.push(ready.clone());
+        let mut stop = stop_rx.clone();
+        supervisors.spawn(async move {
+            loop {
+                let status = tokio::select! {
+                    status = child.wait() => status,
+                    _ = stop.changed() => {
+                        stop_worker(&mut child).await;
+                        return;
+                    }
+                };
+                ready.store(false, Ordering::Relaxed);
+                tracing::warn!("worker on port {} exited: {:?}", worker_port, status);
+                loop {
+                    // ponytail: fixed retry bounds crash loops; add backoff if
+                    // persistently failing worker configurations need it.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if stop.has_changed().unwrap_or(true) {
+                        return;
+                    }
+                    match cmd.spawn() {
+                        Ok(mut replacement) => {
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                            match wait_for_serve_worker(&mut replacement, worker_port, deadline).await {
+                                Ok(()) => {
+                                    child = replacement;
+                                    ready.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                                Err(error) => tracing::warn!("worker {} restart failed: {}", worker_port, error),
+                            }
+                        }
+                        Err(error) => tracing::warn!("worker {} spawn failed: {}", worker_port, error),
+                    }
+                }
             }
-            match TcpStream::connect(("127.0.0.1", worker_port)).await {
-                Ok(stream) => {
-                    drop(stream);
-                    break;
-                }
-                Err(_) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
-                }
-                Err(error) => {
-                    return Err(error.into());
-                }
-            }
-        }
+        });
     }
 
     // The load balancer is bound to the requested host, not hardcoded loopback.
@@ -698,12 +765,26 @@ async fn run_multi_worker_serve(
     let mut next_worker = 0usize;
 
     loop {
-        let (client_stream, peer_addr) = listener.accept().await?;
+        let (client_stream, peer_addr) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = &mut shutdown => break,
+        };
         if let Err(error) = client_stream.set_nodelay(true) {
             tracing::warn!("client {} TCP_NODELAY failed: {}", peer_addr, error);
         }
-        let worker_port = worker_ports[next_worker % worker_ports.len()];
-        next_worker = next_worker.wrapping_add(1);
+        let worker_port = (0..worker_ports.len()).find_map(|_| {
+            let index = next_worker % worker_ports.len();
+            next_worker = next_worker.wrapping_add(1);
+            availability[index].load(Ordering::Relaxed).then_some(worker_ports[index])
+        });
+        let Some(worker_port) = worker_port else {
+            tokio::spawn(async move {
+                let mut client = client_stream;
+                let _ = client.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n").await;
+                let _ = client.shutdown().await;
+            });
+            continue;
+        };
 
         tracing::debug!("Routing {} to worker port {}", peer_addr, worker_port);
 
@@ -801,6 +882,56 @@ async fn run_multi_worker_serve(
             }
         });
     }
+
+    tracing::info!("Shutting down, stopping workers");
+    drop(stop_tx);
+    // Workers are stopped in parallel by their supervisors; anything left after
+    // the grace period is aborted, and kill_on_drop then kills the child.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while supervisors.join_next().await.is_some() {}
+    })
+    .await;
+    Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT (Ctrl-C elsewhere). Handlers are installed
+/// when this is called, not on first poll.
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+    }
+}
+
+/// Ask a worker to exit (SIGTERM lets it flush cookies), then kill it if it is
+/// still running after a short grace period.
+async fn stop_worker(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: plain signal send to a child we still own (not yet reaped).
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    let _ = child.kill().await;
 }
 
 async fn settle_page(page: &mut Page, wait_secs: u64, fixed: bool) {
@@ -969,7 +1100,7 @@ async fn run_fetch(
     .await
     {
         Ok(result) => {
-            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, e))?
+            result.map_err(|e| anyhow::anyhow!("Failed to navigate to {}: {}", url_str, operator_network_error(e)))?
         }
         Err(_) => anyhow::bail!(
             "Timed out navigating to {} after {}s",
@@ -1265,7 +1396,7 @@ async fn fetch_original_response(
             );
             return match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
                 Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+                Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
                 Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
             };
         }
@@ -1281,7 +1412,7 @@ async fn fetch_original_response(
 
     match timeout(Duration::from_secs(timeout_secs), client.fetch(&url)).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, e),
+        Ok(Err(e)) => anyhow::bail!("Failed to fetch {}: {}", url_str, operator_network_error(e)),
         Err(_) => anyhow::bail!("Timed out fetching {} after {}s", url_str, timeout_secs),
     }
 }

@@ -424,7 +424,9 @@ pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
-        if name == "animation" || name.starts_with("animation-") {
+        // display:none determines whether a CSS animation can exist, even
+        // when an important declaration overrides the normal display value.
+        if name == "display" || name == "animation" || name.starts_with("animation-") {
             apply_value(style, &name, value.trim());
         }
     }
@@ -1251,6 +1253,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             apply_font_size(style, value);
         }
         "letter-spacing" => apply_letter_spacing(style, value),
+        "word-spacing" => apply_word_spacing(style, value),
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
             let lower = value.trim().to_ascii_lowercase();
@@ -2150,6 +2153,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "color-scheme"
             | "font-size"
             | "letter-spacing"
+            | "word-spacing"
             | "font"
             | "font-weight"
             | "font-family"
@@ -2994,6 +2998,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
     };
     match name {
         "width" | "inline-size" => lower == "fit-content" || dimension(value, true),
+        "word-spacing" => lower == "normal" || parse_word_spacing_length(value).is_some(),
         "height" | "block-size" | "min-width" | "min-inline-size" | "min-height"
         | "min-block-size" | "max-width" | "max-inline-size" | "max-height" | "max-block-size"
         | "flex-basis" => dimension(value, true),
@@ -7032,17 +7037,17 @@ fn valid_counter_name(name: &str) -> bool {
             .contains(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ')' | ',' | '"' | '\''))
 }
 
-/// Absolute keyword font-sizes (the `medium`-anchored scale), for the handful
-/// of pages that still use them.
+/// Absolute keyword font-sizes using the default 16px medium scale.
 fn font_size_keyword(v: &str) -> Option<f32> {
     Some(match v.to_ascii_lowercase().as_str() {
-        "xx-small" => 9.6,
-        "x-small" => 12.0,
-        "small" => 13.3,
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
         "medium" => 16.0,
         "large" => 18.0,
         "x-large" => 24.0,
         "xx-large" => 32.0,
+        "xxx-large" => 48.0,
         _ => return None,
     })
 }
@@ -7093,6 +7098,50 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
             style.font_size = None;
             style.font_size_raw = Some(rel);
         }
+    }
+}
+
+fn apply_word_spacing(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "inherit" | "unset" | "revert" | "revert-layer") {
+        style.word_spacing = None;
+        style.word_spacing_raw = None;
+        return;
+    }
+    if matches!(lower.as_str(), "normal" | "initial") {
+        style.word_spacing = Some(0.0);
+        style.word_spacing_raw = None;
+        return;
+    }
+    // Invalid declarations must not replace an earlier cascade winner.
+    match parse_word_spacing_length(value) {
+        Some(crate::Dimension::Px(pixels)) => {
+            style.word_spacing = Some(pixels);
+            style.word_spacing_raw = None;
+        }
+        Some(relative) => {
+            style.word_spacing = None;
+            style.word_spacing_raw = Some(relative);
+        }
+        None => {}
+    }
+}
+
+fn parse_word_spacing_length(value: &str) -> Option<crate::Dimension> {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let length = match parser.next().ok()? {
+        cssparser::Token::Number { value, .. } if *value == 0.0 => crate::Dimension::Px(0.0),
+        cssparser::Token::Dimension { value, unit, .. } if value.is_finite() => {
+            dimension_value(&format!("{value}{unit}"))
+        }
+        _ => return None,
+    };
+    if !parser.is_exhausted() { return None; }
+    match length.resolve(16.0, 16.0, 1.0, 1.0) {
+        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(length),
+        _ => None,
     }
 }
 
@@ -7222,6 +7271,22 @@ pub(crate) fn line_height_expression_is_length(value: &str) -> bool {
 /// the required size so modern design-system declarations reach the size,
 /// line-height, weight, style, and family fields that affect our layout.
 fn apply_font_shorthand(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("inherit") || value.eq_ignore_ascii_case("unset") {
+        // All modeled font longhands are inherited. Clear earlier declarations,
+        // including native-control UA defaults, before the top-down pass.
+        style.font_size = None;
+        style.font_size_raw = None;
+        style.font_size_expression = None;
+        style.font_family = None;
+        style.font_weight = None;
+        style.font_style_italic = None;
+        style.font_optical_sizing = None;
+        style.font_variation_settings = None;
+        style.line_height = None;
+        style.line_height_expression = None;
+        return;
+    }
     let tokens = split_ws_paren(value);
     let Some((size_index, size, attached_line_height)) =
         tokens.iter().enumerate().find_map(|(index, token)| {

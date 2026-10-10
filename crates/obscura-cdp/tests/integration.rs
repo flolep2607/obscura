@@ -40,6 +40,7 @@ integration_tests!(
     file_navigation_gate,
     form_submit_method_bypasses_listener,
     iframe_event_dispatch,
+    input_activation_author_accessors,
     input_key_event_escaping,
     input_mouse_event_parity,
     input_mouse_label_activation,

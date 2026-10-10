@@ -86,13 +86,13 @@ Use one worker per CPU core. Each worker handles its own pool of pages. Sessions
 
 ## V8 heap
 
-Default V8 heap is 4 GB on 64-bit systems. The defaults also cap the young generation (`--max-semi-space-size=4`) and pass `--optimize-for-size` to hold RSS down. Override:
+The V8 old-generation ceiling is 4 GB on 64-bit systems. The defaults request `--max-semi-space-size=4`, but the current V8's `--optimize-for-size` implication overrides the effective semi-space cap to 1 MiB. Override the old-generation ceiling with:
 
 ```bash
-obscura serve --v8-flags "--max-old-space-size=2048"
+obscura --v8-flags "--max-old-space-size=2048" serve
 ```
 
-Flags you pass are appended after the defaults, and V8 uses the last value for a repeated flag, so your `--max-old-space-size` wins while the memory-tuning defaults stay in effect. Lower for memory-constrained hosts, raise for heavy SPAs.
+Flags you pass are appended after the defaults, so this old-generation override retains memory tuning. To change the young-generation cap, also pass `--no-optimize-for-size`; V8's flag implications otherwise override your cap. Disabling size optimization can save GC CPU but increase peak memory. Benchmark both before changing production defaults.
 
 ## Parallel scrape
 

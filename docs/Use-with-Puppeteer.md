@@ -85,6 +85,11 @@ page.on('request', req => {
 
 See [Intercept and modify requests](Intercept-and-modify-requests.md).
 
+Scripted fetch/XHR requests in stealth mode report Network events and retained
+response bodies using the same request IDs as the normal transport. The existing
+`OBSCURA_NETWORK_BODY_BUFFER_ENTRIES` and `OBSCURA_NETWORK_BODY_BUFFER_BYTES`
+settings still control retention; disabling retention does not disable events.
+
 ## Expose a Node callback
 
 ```js
@@ -168,3 +173,10 @@ await browser.disconnect();  // leaves obscura serve running
   compositor behavior remains incomplete relative to Chromium.
 - Pages share one V8 isolate; CPU-bound JavaScript serializes across pages.
 - PDF text is not selectable/searchable and tagged PDF is not yet available.
+
+Network events are shared by sessions attached to the same target. An additional
+CDP session can observe navigation and later fetch/XHR traffic without issuing a
+second navigation. Request IDs and loader IDs match the driving session, so
+`Network.getResponseBody` uses the same ID. Fetch interception control and the
+navigation lifecycle keep their existing owner; sessions on other targets do
+not receive this traffic.
