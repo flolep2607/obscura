@@ -42,7 +42,7 @@ const __obscuraCore = globalThis.Deno.core;
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
-    '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
+    '_getElementsByClassName', '_docEncoding', '_docIsUtf8', '_docContentType',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
@@ -2919,6 +2919,18 @@ function _docEncoding() {
   return __docEncoding;
 }
 function _docIsUtf8() { if (__docIsUtf8 === undefined) _docEncoding(); return __docIsUtf8; }
+// The main resource's MIME type. Cached per runtime for the same reason as
+// the encoding: it is fixed for a document's lifetime and contentType is read
+// on every _isXMLDocument() call. Empty when the navigation had no usable
+// Content-Type header, so the caller can fall back to URL-derived sniffing.
+let __docContentType;
+function _docContentType() {
+  if (__docContentType === undefined) {
+    const t = _domParse("document_content_type");
+    __docContentType = (typeof t === 'string') ? t : '';
+  }
+  return __docContentType;
+}
 // WHATWG "special scheme" check (these get the special-query percent-encode set).
 function _isSpecialScheme(protocol) {
   const s = (protocol || '').replace(/:$/, '').toLowerCase();
@@ -5833,12 +5845,19 @@ class Document extends Node {
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
+    const get = _documentRealmMember(this, 'contentType');
+    if (get) return Reflect.apply(get, this, []);
     // An explicit type set by DOMParser/createDocument wins.
     if (this._contentType) return this._contentType;
     // `new Document()` (the WHATWG constructor, no backing node id) creates an
     // XML document, so createCDATASection/etc. must not throw. Live documents
     // wrapped from the tree carry a real nid and fall through to URL-derived.
     if (this._nid === undefined || this._nid === null) return "application/xml";
+    // The main resource's own MIME type wins over the URL: a text/plain or
+    // text/markdown response must not report text/html just because its URL
+    // has no extension.
+    const main = _docContentType();
+    if (main) return main;
     const url = this.URL || "";
     // data: URLs carry their MIME type explicitly.
     const dm = /^data:([^,;]+)/i.exec(url);
@@ -13386,10 +13405,13 @@ globalThis.Comment = Comment;
 globalThis.CDATASection = CDATASection;
 globalThis.ProcessingInstruction = ProcessingInstruction;
 // True when the document was loaded from an XML/XHTML source. Obscura has no
-// native XML tree, so this is inferred from contentType (derived from the URL).
+// native XML tree, so this is inferred from contentType. Only the XML types
+// count: a plain-text document (text/plain, text/markdown) is still an HTML
+// document for createCDATASection/createProcessingInstruction purposes.
 function _isXMLDocument(doc) {
   const ct = (doc && doc.contentType) || "text/html";
-  return ct !== "text/html";
+  return ct === "application/xhtml+xml" || ct === "text/xml"
+    || ct === "application/xml" || ct.endsWith("+xml");
 }
 // XML Name production, sufficient for createProcessingInstruction targets.
 const _piNameStart = "A-Za-z_:\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD";
@@ -17221,7 +17243,7 @@ function _installCaretGeometry() {
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),

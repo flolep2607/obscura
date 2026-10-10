@@ -1260,6 +1260,13 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().encoding = encoding.to_string();
     }
 
+    /// Set the document's MIME type. Backs `document.contentType`, which
+    /// reports the type of the main resource rather than one guessed from
+    /// the URL.
+    pub fn set_content_type(&self, content_type: &str) {
+        self.state.borrow_mut().content_type = content_type.to_string();
+    }
+
     pub fn set_title(&self, title: &str) {
         self.state.borrow_mut().title = title.to_string();
     }
@@ -4540,6 +4547,16 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn document_content_type_retains_url_fallback_without_response_metadata() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/document.xhtml");
+        rt.run_page_init();
+        assert_eq!(rt.evaluate("document.contentType").unwrap(),
+            serde_json::json!("application/xhtml+xml"));
     }
 
     #[test]

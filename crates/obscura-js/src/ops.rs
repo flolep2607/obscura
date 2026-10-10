@@ -159,6 +159,10 @@ pub struct ObscuraState {
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
+    /// MIME type of the document's main resource, lowercased and without
+    /// parameters. Backs `document.contentType`; a `text/plain` navigation
+    /// must not report `text/html` just because the URL has no extension.
+    pub content_type: String,
     pub title: String,
     /// URL of the document that initiated this document's navigation. Direct
     /// browser/API navigations leave this empty; document-initiated
@@ -426,6 +430,7 @@ impl ObscuraState {
             about_base_url: None,
             inherited_origin: None,
             encoding: "UTF-8".to_string(),
+            content_type: String::new(),
             title: String::new(),
             referrer: String::new(),
             navigation_timing: NavigationTiming::default(),
@@ -2178,6 +2183,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
+        "document_content_type" => {
+            serde_json::to_string(&gs.content_type).unwrap_or("\"text/html\"".into())
+        }
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
