@@ -64,6 +64,7 @@ pub struct CdpContext {
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
     pub pending_events: Vec<CdpEvent>,
+    pub(crate) pending_beforeunload_close: HashMap<String, Option<String>>,
     #[cfg(feature = "render")]
     pub(crate) screencasts: HashMap<String, ScreencastState>,
     #[cfg(feature = "render")]
@@ -178,6 +179,7 @@ impl CdpContext {
             nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
+            pending_beforeunload_close: HashMap::new(),
             #[cfg(feature = "render")]
             screencasts: HashMap::new(),
             #[cfg(feature = "render")]
@@ -331,6 +333,7 @@ impl CdpContext {
     }
 
     pub fn remove_page(&mut self, id: &str) {
+        self.pending_beforeunload_close.remove(id);
         let removed_sessions: Vec<String> = self
             .sessions
             .iter()
@@ -684,6 +687,7 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.setLifecycleEventsEnabled"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
+            | "Page.setBypassCSP"
             | "Page.getNavigationHistory"
             | "Page.resetNavigationHistory"
             | "Page.captureSnapshot"
@@ -1257,6 +1261,32 @@ mod tests {
         assert!(
             resp.error.is_none(),
             "Audits.enable should not error: {:?}",
+            resp.error
+        );
+        assert_eq!(resp.result, Some(json!({})));
+    }
+
+    // Playwright sends Page.setBypassCSP for every new page of a context
+    // created with `bypassCSP: true`; an unknown-method error there fails
+    // page creation outright (changedetection.io always sets it).
+    #[tokio::test]
+    async fn page_set_bypass_csp_returns_empty_success() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("bypass-csp".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        let resp = dispatch(
+            &CdpRequest {
+                session_id: session,
+                params: json!({"enabled": true}),
+                ..req("Page.setBypassCSP")
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(
+            resp.error.is_none(),
+            "Page.setBypassCSP should not error: {:?}",
             resp.error
         );
         assert_eq!(resp.result, Some(json!({})));

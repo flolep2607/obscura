@@ -80,9 +80,10 @@ pub struct StoredNetworkResponseBody {
 /// it. Static navigation subresources go through Page::record_network_event;
 /// this is the parallel channel for script-initiated requests, which run in the
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
+/// ES-module graph responses share this queue through the module loader.
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
-    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Matches the request id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
     /// The interception consumer already received the request start.
@@ -159,6 +160,10 @@ pub struct ObscuraState {
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
+    /// MIME type of the document's main resource, lowercased and without
+    /// parameters. Backs `document.contentType`; a `text/plain` navigation
+    /// must not report `text/html` just because the URL has no extension.
+    pub content_type: String,
     pub title: String,
     /// URL of the document that initiated this document's navigation. Direct
     /// browser/API navigations leave this empty; document-initiated
@@ -189,6 +194,9 @@ pub struct ObscuraState {
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
+    /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
+    /// sent to the interception channel; empty means every request.
+    pub intercept_url_patterns: Vec<String>,
     pub intercept_page_id: String,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
@@ -278,12 +286,13 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
-    /// Waiters sharing an asynchronous HTMLImageElement request. The key keeps
+    /// Cancellation handle and waiters sharing an HTMLImageElement request. The key keeps
     /// navigation identity and request credentials separate so neither stale
     /// pages nor incompatible CORS profiles share a completion.
     #[cfg(feature = "render")]
     pub render_image_in_flight:
-        HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
+        HashMap<(u64, String, ImageRequestProfile),
+            (tokio::sync::oneshot::Sender<()>, Vec<tokio::sync::oneshot::Sender<()>>)>,
     /// Page-transport loads for resources that cache-only layout or paint
     /// missed. The owning page fetches them and sends the outcome here; the
     /// runtime applies results at its own event-loop turns and at every
@@ -423,6 +432,7 @@ impl ObscuraState {
             about_base_url: None,
             inherited_origin: None,
             encoding: "UTF-8".to_string(),
+            content_type: String::new(),
             title: String::new(),
             referrer: String::new(),
             navigation_timing: NavigationTiming::default(),
@@ -437,6 +447,7 @@ impl ObscuraState {
             pending_history_traversal: None,
             intercept_tx: None,
             intercept_enabled: false,
+            intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
@@ -667,12 +678,20 @@ fn record_js_network_completion(
     let state_borrow = state.borrow();
     let gs = state_borrow.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
+        body: body.to_string(), base64_encoded,
+    });
+}
+
+pub(crate) fn record_network_completion(
+    gs: &mut ObscuraState,
+    event: JsNetworkEvent,
+    body: impl FnOnce() -> StoredNetworkResponseBody,
+) {
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
-            body: body.to_string(), base64_encoded,
-        });
+        gs.network_response_bodies.insert(event.request_id.clone(), body());
         gs.network_response_body_order.push_back(event.request_id.clone());
         while gs.network_response_body_order.len() > max_entries {
             if let Some(oldest) = gs.network_response_body_order.pop_front() {
@@ -680,7 +699,7 @@ fn record_js_network_completion(
             }
         }
     }
-    push_js_network_event(&mut gs, event);
+    push_js_network_event(gs, event);
 }
 
 fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
@@ -2500,6 +2519,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
+        "document_content_type" => {
+            serde_json::to_string(&gs.content_type).unwrap_or("\"text/html\"".into())
+        }
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
@@ -3740,6 +3762,55 @@ fn visible_response_headers(
         .collect()
 }
 
+/// Match a CDP `Fetch.enable` / `Network.setBlockedURLs` URL pattern, where
+/// `*` matches any run, `?` matches one character, and backslash escapes.
+/// Shared with the CDP layer so reported pauses match live interception.
+pub fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut pattern = pattern.chars();
+    let mut url = url.chars();
+    let mut star = None;
+    loop {
+        let mut next_pattern = pattern.clone();
+        match next_pattern.next() {
+            Some('*') => {
+                pattern = next_pattern;
+                star = Some((pattern.clone(), url.clone()));
+                continue;
+            }
+            None if url.as_str().is_empty() => return true,
+            Some(token) => {
+                let literal = if token == '\\' { next_pattern.next() } else { Some(token) };
+                let mut next_url = url.clone();
+                if let Some(character) = next_url.next() {
+                    if token == '?' || literal == Some(character) {
+                        pattern = next_pattern;
+                        url = next_url;
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let Some((saved_pattern, saved_url)) = &mut star else {
+            return false;
+        };
+        if saved_url.next().is_none() {
+            return false;
+        }
+        pattern = saved_pattern.clone();
+        url = saved_url.clone();
+    }
+}
+
+/// Whether a scripted request is paused for the interception consumer. Like
+/// Chrome, only requests matching a `Fetch.enable` URL pattern pause.
+pub(crate) fn should_intercept_url(enabled: bool, patterns: &[String], url: &str) -> bool {
+    enabled && (patterns.is_empty() || patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url)))
+}
+
 /// Build the JS-facing result for an intercepted request a CDP client chose to
 /// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
 /// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
@@ -3872,7 +3943,7 @@ async fn fetch_url_inner(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let itx = if gs.intercept_enabled {
+        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
             gs.intercept_tx.clone()
         } else {
             None
@@ -4790,6 +4861,51 @@ mod tests {
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn scripted_requests_pause_only_for_matching_fetch_patterns() {
+        let url = "https://example.test/value/1";
+        assert!(!super::should_intercept_url(false, &[], url));
+        assert!(super::should_intercept_url(true, &[], url));
+        assert!(super::should_intercept_url(true, &["*".to_string()], url));
+        assert!(super::should_intercept_url(true, &["*/value/*".to_string()], url));
+        assert!(!super::should_intercept_url(true, &["*never-matches*".to_string()], url));
+        assert!(super::should_intercept_url(
+            true,
+            &["*never-matches*".to_string(), "https://example.test/*".to_string()],
+            url
+        ));
+    }
+
+    #[test]
+    fn interception_patterns_match_repeated_suffixes_and_escaped_wildcards() {
+        for (pattern, url, expected) in [
+            ("/a*abc", "/aabcabc", true),
+            ("*abc", "abcabc", true),
+            ("/a?c", "/abc", true),
+            ("/a?c", "/ac", false),
+            ("/a?c", "/abbc", false),
+            (r"/a\?c", "/a?c", true),
+            (r"/a\?c", "/abc", false),
+            (r"/a\*c", "/a*c", true),
+            (r"/a\*c", "/abc", false),
+            (r"/a\\c", r"/a\c", true),
+            ("/a?c", "/aéc", true),
+            ("", "", true),
+            ("", "/", false),
+            ("**", "", true),
+            ("/a*c", "/ab", false),
+            ("*ab*bc", "ababbbc", true),
+            ("*ab*bc", "abbcd", false),
+            ("*?*", "", false),
+            ("*?*", "abc", true),
+            ("ab*cd*ef", "abxxcdyyef", true),
+            ("ab*cd*ef", "abxxcdyyefzz", false),
+        ] {
+            assert_eq!(super::url_matches_cdp_pattern(pattern, url), expected,
+                "pattern {pattern:?}, URL {url:?}");
+        }
+    }
 
     // #967 — a redirect must not forward the caller's credentials to a
     // different origin, and a 301/302/303 GET downgrade drops the body headers.
@@ -8016,16 +8132,17 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
 
     // Different CORS/credential profiles do not share an in-flight response.
     let request_key = (document_generation, selected_url.clone(), request_profile);
-    let follower = {
+    let (follower, cancel_rx) = {
         let mut gs = shared.borrow_mut();
-        if let Some(waiters) = gs.render_image_in_flight.get_mut(&request_key) {
+        if let Some((_, waiters)) = gs.render_image_in_flight.get_mut(&request_key) {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             waiters.push(sender);
-            Some(receiver)
+            (Some(receiver), None)
         } else {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             gs.render_image_in_flight
-                .insert(request_key.clone(), Vec::new());
-            None
+                .insert(request_key.clone(), (cancel_tx, Vec::new()));
+            (None, Some(cancel_rx))
         }
     };
     if let Some(receiver) = follower {
@@ -8038,6 +8155,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             request_profile,
         );
     }
+    let cancel_rx = cancel_rx.expect("image request leader owns cancellation");
 
     struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageImageInFlightGuard {
@@ -8049,7 +8167,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     let _page_in_flight = PageImageInFlightGuard(page_in_flight);
 
     let parsed_url = url::Url::parse(&selected_url).ok();
-    let response = if blocked || parsed_url.is_none() {
+    let fetch = async { if blocked || parsed_url.is_none() {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
@@ -8086,6 +8204,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .await
                 .ok()
         }
+    } };
+    let response = tokio::select! {
+        response = fetch => response,
+        _ = cancel_rx => None,
     };
     let bytes = response.and_then(|response| {
         (200..300)
@@ -8094,7 +8216,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     });
     let waiters = {
         let mut gs = shared.borrow_mut();
-        if gs.document_generation == document_generation {
+        if gs.document_generation == document_generation && gs.render_image_in_flight.contains_key(&request_key) {
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
@@ -8120,6 +8242,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         }
         gs.render_image_in_flight
             .remove(&request_key)
+            .map(|(_, waiters)| waiters)
             .unwrap_or_default()
     };
     for waiter in waiters {

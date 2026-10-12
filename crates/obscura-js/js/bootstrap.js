@@ -21,7 +21,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
-    '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    '__obscura_stealth', '__obscura_markTrusted', '__obscura_fireBeforeUnload', '__obscura_core_handoff',
     // Created by later evaluation, input and emulation paths. Register them
     // before the snapshot hide list is captured, just like the other internals.
     '__obscura_await_rejected', '__obscura_click_target',
@@ -42,7 +42,7 @@ const __obscuraCore = globalThis.Deno.core;
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
     '_fpCache', '_getFp', '_fp', '_splitAsciiWhitespace',
-    '_getElementsByClassName', '_docEncoding', '_docIsUtf8',
+    '_getElementsByClassName', '_docEncoding', '_docIsUtf8', '_docContentType',
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
@@ -2086,7 +2086,13 @@ function _eventTargetDispatch(target, event) {
     const eventHandler = target === globalThis ? target['on' + event.type] : null;
     if (typeof eventHandler === 'function') {
       try {
-        if (eventHandler.call(target, event) === false) event.preventDefault();
+        const result = eventHandler.call(target, event);
+        if (event.type === 'beforeunload' && _beforeUnloadValues.has(event)) {
+          if (result != null) {
+            event.preventDefault();
+            if (event.returnValue === '') event.returnValue = result;
+          }
+        } else if (result === false) event.preventDefault();
       } catch (error) {
         console.error(error);
       }
@@ -3056,6 +3062,18 @@ function _docEncoding() {
   return __docEncoding;
 }
 function _docIsUtf8() { if (__docIsUtf8 === undefined) _docEncoding(); return __docIsUtf8; }
+// The main resource's MIME type. Cached per runtime for the same reason as
+// the encoding: it is fixed for a document's lifetime and contentType is read
+// on every _isXMLDocument() call. Empty when the navigation had no usable
+// Content-Type header, so the caller can fall back to URL-derived sniffing.
+let __docContentType;
+function _docContentType() {
+  if (__docContentType === undefined) {
+    const t = _domParse("document_content_type");
+    __docContentType = (typeof t === 'string') ? t : '';
+  }
+  return __docContentType;
+}
 // WHATWG "special scheme" check (these get the special-query percent-encode set).
 function _isSpecialScheme(protocol) {
   const s = (protocol || '').replace(/:$/, '').toLowerCase();
@@ -5996,12 +6014,19 @@ class Document extends Node {
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
+    const get = _documentRealmMember(this, 'contentType');
+    if (get) return Reflect.apply(get, this, []);
     // An explicit type set by DOMParser/createDocument wins.
     if (this._contentType) return this._contentType;
     // `new Document()` (the WHATWG constructor, no backing node id) creates an
     // XML document, so createCDATASection/etc. must not throw. Live documents
     // wrapped from the tree carry a real nid and fall through to URL-derived.
     if (this._nid === undefined || this._nid === null) return "application/xml";
+    // The main resource's own MIME type wins over the URL: a text/plain or
+    // text/markdown response must not report text/html just because its URL
+    // has no extension.
+    const main = _docContentType();
+    if (main) return main;
     const url = this.URL || "";
     // data: URLs carry their MIME type explicitly.
     const dm = /^data:([^,;]+)/i.exec(url);
@@ -10879,7 +10904,20 @@ globalThis.DOMException = (function () {
 // obscura's CDP input pipeline marks its synthetic events via the
 // non-enumerable __obscura_markTrusted helper.
 const _trustedEvents = new WeakSet();
-globalThis.__obscura_markTrusted = function(ev) { try { if (ev) _trustedEvents.add(ev); } catch (_e) {} return ev; };
+let _hasStickyActivation = false;
+globalThis.__obscura_markTrusted = function(ev) {
+  try {
+    if (ev) {
+      _trustedEvents.add(ev);
+      if ((ev.type === 'keydown' && ev.key !== 'Escape') || ev.type === 'mousedown'
+          || (ev.type === 'pointerdown' && ev.pointerType === 'mouse')
+          || (ev.type === 'pointerup' && ev.pointerType !== 'mouse') || ev.type === 'touchend') {
+        _hasStickyActivation = true;
+      }
+    }
+  } catch (_e) {}
+  return ev;
+};
 
 // Write value/checked through the element's *prototype* accessor, skipping any
 // per-instance property a framework layered on top. React (and Preact/Vue)
@@ -10907,10 +10945,13 @@ globalThis.__obscura_setHovered = function(el) {
   }
 };
 
-// Build a FileList-like object: an array with the DOM's `item(i)` accessor.
+// Build a FileList: indexed File entries plus the DOM's length and `item(i)`
+// accessor. Real instances of the FileList global (issue #1232), not arrays,
+// so `input.files instanceof FileList` holds.
 function _makeFileList(files) {
-  const list = files.slice();
-  Object.defineProperty(list, "item", { value: (i) => list[i] || null, enumerable: false });
+  const list = Object.create(FileList.prototype);
+  for (let i = 0; i < files.length; i++) list[i] = files[i];
+  Object.defineProperty(list, "length", { value: files.length, enumerable: false, writable: false });
   return list;
 }
 function _emptyFileList() { return _makeFileList([]); }
@@ -10954,6 +10995,28 @@ globalThis.Event = class Event {
     return path;
   }
 };
+
+const _beforeUnloadValues = new WeakMap();
+globalThis.BeforeUnloadEvent = class BeforeUnloadEvent extends Event {
+  constructor() { throw new TypeError('Illegal constructor'); }
+  get returnValue() {
+    if (!_beforeUnloadValues.has(this)) throw new TypeError('Illegal invocation');
+    return _beforeUnloadValues.get(this);
+  }
+  set returnValue(value) {
+    if (!_beforeUnloadValues.has(this)) throw new TypeError('Illegal invocation');
+    _beforeUnloadValues.set(this, String(value));
+  }
+};
+globalThis.__obscura_fireBeforeUnload = function() {
+  const event = new Event('beforeunload', { cancelable: true });
+  _beforeUnloadValues.set(event, '');
+  Object.setPrototypeOf(event, BeforeUnloadEvent.prototype);
+  globalThis.__obscura_markTrusted(event);
+  const allowed = globalThis.dispatchEvent(event);
+  return _hasStickyActivation && (!allowed || event.returnValue !== '');
+};
+_markNative(BeforeUnloadEvent);
 _markNative(Event);
 globalThis.CustomEvent = class extends Event {
   constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }
@@ -11442,6 +11505,15 @@ if (typeof File === "undefined") globalThis.File = class File extends Blob {
     this.lastModified = opts.lastModified != null ? Number(opts.lastModified) : Date.now();
   }
   get [Symbol.toStringTag]() { return "File"; }
+};
+// Issue #1232: `typeof FileList` was `undefined`, so apps that reference it
+// while booting crash with a ReferenceError. Not directly constructible,
+// matching Chrome (`new FileList()` throws "Illegal constructor").
+if (typeof FileList === "undefined") globalThis.FileList = class FileList {
+  constructor() { throw new TypeError("Illegal constructor"); }
+  item(i) { const v = this[i]; return v === undefined ? null : v; }
+  [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
+  get [Symbol.toStringTag]() { return "FileList"; }
 };
 // A FormData value keeps Blob/File objects as-is (the multipart serializer reads
 // their bytes); every other value is coerced to a string per the Fetch spec.
@@ -13579,10 +13651,13 @@ globalThis.Comment = Comment;
 globalThis.CDATASection = CDATASection;
 globalThis.ProcessingInstruction = ProcessingInstruction;
 // True when the document was loaded from an XML/XHTML source. Obscura has no
-// native XML tree, so this is inferred from contentType (derived from the URL).
+// native XML tree, so this is inferred from contentType. Only the XML types
+// count: a plain-text document (text/plain, text/markdown) is still an HTML
+// document for createCDATASection/createProcessingInstruction purposes.
 function _isXMLDocument(doc) {
   const ct = (doc && doc.contentType) || "text/html";
-  return ct !== "text/html";
+  return ct === "application/xhtml+xml" || ct === "text/xml"
+    || ct === "application/xml" || ct.endsWith("+xml");
 }
 // XML Name production, sufficient for createProcessingInstruction targets.
 const _piNameStart = "A-Za-z_:\\u00C0-\\u00D6\\u00D8-\\u00F6\\u00F8-\\u02FF\\u0370-\\u037D\\u037F-\\u1FFF\\u200C-\\u200D\\u2070-\\u218F\\u2C00-\\u2FEF\\u3001-\\uD7FF\\uF900-\\uFDCF\\uFDF0-\\uFFFD";
@@ -17426,7 +17501,7 @@ function _installCaretGeometry() {
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
