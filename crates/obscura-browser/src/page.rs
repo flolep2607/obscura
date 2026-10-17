@@ -2220,6 +2220,13 @@ impl Page {
             .unwrap_or(30_000);
         let script_deadline =
             tokio::time::Instant::now() + tokio::time::Duration::from_millis(script_deadline_ms);
+        // Per-script fetch budget (see the fetch below). Override with OBSCURA_SCRIPT_FETCH_TIMEOUT_MS=<ms>.
+        let script_fetch_timeout = tokio::time::Duration::from_millis(
+            std::env::var("OBSCURA_SCRIPT_FETCH_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10_000),
+        );
 
         // Hard backstop over the WHOLE script-execution phase. Inline scripts
         // run back-to-back with no await between them, so neither the soft
@@ -2436,13 +2443,26 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
-                        .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
+                    // Each script gets its own fetch budget: one third-party host that never
+                    // answers (a tracker) must not hold every other script, and the page,
+                    // until the whole-phase deadline below.
+                    match tokio::time::timeout(
+                        script_fetch_timeout,
+                        client.fetch_resource_with_callbacks(&parsed, request, Some(&cbs)),
+                    )
+                    .await
                     {
-                        Ok(resp) => Some((idx, url, resp)),
-                        Err(e) => {
+                        Ok(Ok(resp)) => Some((idx, url, resp)),
+                        Ok(Err(e)) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
+                            None
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "Script fetch timed out after {}ms: {}",
+                                script_fetch_timeout.as_millis(),
+                                url
+                            );
                             None
                         }
                     }
@@ -2456,21 +2476,24 @@ impl Page {
         // 16 is well above the per-host pool ceiling most browsers use
         // and matches what real Chrome does for a given origin.
         use futures::StreamExt as _;
-        let fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
-        let fetch_results = match tokio::time::timeout_at(
-            script_deadline,
-            fetch_stream.collect::<Vec<_>>(),
-        )
-        .await
-        {
-            Ok(results) => results,
-            Err(_) => {
-                tracing::warn!(
-                    "execute_scripts: fetch deadline reached, some scripts may not have loaded"
-                );
-                Vec::new()
+        let mut fetch_stream = futures::stream::iter(fetch_futures).buffer_unordered(16);
+        // Keep every script that arrived before the deadline: dropping them all because
+        // one was late ran the page with no external script at all.
+        let mut fetch_results = Vec::new();
+        loop {
+            match tokio::time::timeout_at(script_deadline, fetch_stream.next()).await {
+                Ok(Some(result)) => fetch_results.push(result),
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "execute_scripts: fetch deadline reached, {} of {} scripts arrived",
+                        fetch_results.iter().filter(|r| r.is_some()).count(),
+                        fetch_tasks.len()
+                    );
+                    break;
+                }
             }
-        };
+        }
 
         let mut fetched: std::collections::HashMap<usize, (String, String, obscura_net::Response)> =
             std::collections::HashMap::new();
@@ -7739,6 +7762,41 @@ mod tests {
             serde_json::json!(1.0),
             "window.onload must fire exactly once",
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_unresponsive_script_host_does_not_hold_the_page_or_drop_the_other_scripts() {
+        // A tracker that never answers used to hold the page for the whole script deadline
+        // (30 s) and then every fetched script was dropped with it.
+        // Env vars are process-wide and another test sets a 250 ms script deadline: pin it here too.
+        std::env::set_var("OBSCURA_SCRIPT_FETCH_TIMEOUT_MS", "300");
+        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "1500");
+        let (slow, _slow_requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_secs(3),
+            "globalThis.__slow = 1;",
+        );
+        let (fast, _fast_requests) = spawn_delayed_classic_script_server(
+            std::time::Duration::from_millis(0),
+            "globalThis.__fast = 1;",
+        );
+        let mut page = import_map_test_page(
+            "unresponsive-script-host", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        let html = format!(
+            r#"<html><body><script src="{slow}/tracker.js"></script><script src="{fast}/app.js"></script>
+            <script>globalThis.__after = 1;</script></body></html>"#
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+        let started = std::time::Instant::now();
+        page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+        let took = started.elapsed();
+        std::env::remove_var("OBSCURA_SCRIPT_FETCH_TIMEOUT_MS");
+        std::env::remove_var("OBSCURA_SCRIPT_DEADLINE_MS");
+        assert!(took < std::time::Duration::from_secs(2), "the page waited {took:?} for the dead host");
+        let js = page.js.as_mut().unwrap();
+        assert_eq!(js.evaluate("globalThis.__fast === 1").unwrap(), serde_json::json!(true));
+        assert_eq!(js.evaluate("globalThis.__after === 1").unwrap(), serde_json::json!(true));
+        assert_eq!(js.evaluate("globalThis.__slow === undefined").unwrap(), serde_json::json!(true));
     }
 
     #[tokio::test(flavor = "current_thread")]

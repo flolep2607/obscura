@@ -3507,13 +3507,38 @@ async fn op_fetch_url(
     let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
         .map(|resource| resource.0.clone())
         .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
+    // A script the page inserts (a tag manager, an ad pixel) delays the load event until it
+    // arrives; a host that never answers held pages for the whole script deadline (30 s).
+    // Bound each script fetch like the parser-discovered ones (OBSCURA_SCRIPT_FETCH_TIMEOUT_MS).
+    let script_timeout = (destination == "Script").then(script_fetch_timeout);
+    let log_url = script_timeout.map(|_| url.clone());
     let future = fetch_url_inner(state, url, method, headers_json, body, origin, mode, credentials,
         destination, cancel.clone());
+    let future = async move {
+        match script_timeout {
+            Some(limit) => tokio::time::timeout(limit, future).await.unwrap_or_else(|_| {
+                tracing::warn!("Dynamic script fetch timed out after {}ms: {}",
+                    limit.as_millis(), log_url.as_deref().unwrap_or(""));
+                Err(deno_error::JsErrorBox::generic("Script fetch timed out"))
+            }),
+            None => future.await,
+        }
+    };
     match cancel {
         Some(cancel) => future.or_cancel(cancel).await
             .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
         None => future.await,
     }
+}
+
+/// Per-script fetch budget shared with the parser-discovered script fetch in obscura-browser.
+fn script_fetch_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("OBSCURA_SCRIPT_FETCH_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000),
+    )
 }
 
 #[derive(serde::Deserialize)]
