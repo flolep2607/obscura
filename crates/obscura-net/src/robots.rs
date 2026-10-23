@@ -16,12 +16,34 @@ struct RobotsEntries {
     rules: HashMap<String, RobotsRules>,
     /// Origins in insertion order, oldest first, for eviction.
     order: VecDeque<String>,
+    /// Set by enable_persistence; writes the shared robots-cache.json.
+    persist_path: Option<std::path::PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RobotsRules {
     disallowed: Vec<String>,
     allowed: Vec<String>,
+    /// Wall-clock seconds when the body was fetched, for the shared-file TTL.
+    #[serde(default)]
+    ts: u64,
+}
+
+/// Entries older than this are refetched even when present. The
+/// per-process cache used to live forever; the shared file must not.
+const ROBOTS_TTL_SECS: u64 = 24 * 3600;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRobots {
+    /// Wall-clock seconds when the entry was fetched.
+    entries: HashMap<String, RobotsRules>,
 }
 
 impl RobotsCache {
@@ -33,8 +55,13 @@ impl RobotsCache {
 
     pub fn parse_and_store(&self, domain: &str, body: &str, our_agent: &str) {
         let rules = parse_robots_txt(truncate_body(body), our_agent);
+        let fresh = RobotsRules {
+            disallowed: rules.disallowed,
+            allowed: rules.allowed,
+            ts: now_secs(),
+        };
         let mut cache = self.cache.write().unwrap();
-        if cache.rules.insert(domain.to_string(), rules).is_none() {
+        if cache.rules.insert(domain.to_string(), fresh).is_none() {
             cache.order.push_back(domain.to_string());
         }
         while cache.rules.len() > MAX_ROBOTS_ENTRIES {
@@ -43,6 +70,75 @@ impl RobotsCache {
             };
             cache.rules.remove(&oldest);
         }
+        let should_persist = cache.persist_path.is_some();
+        drop(cache);
+        if should_persist {
+            self.persist();
+        }
+    }
+
+    /// Share this cache through `{storage_dir}/robots-cache.json`: entries
+    /// are loaded once and every newly fetched origin is merged back, so
+    /// sibling processes and recycled workers stop refetching robots.txt for
+    /// the same site. Idempotent; safe to call on every navigation.
+    pub fn enable_persistence(&self, dir: &std::path::Path) {
+        {
+            let cache = self.cache.read().unwrap();
+            if cache.persist_path.is_some() {
+                return;
+            }
+        }
+        let path = dir.join("robots-cache.json");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut cache = self.cache.write().unwrap();
+        if cache.persist_path.is_some() {
+            return;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(persisted) = serde_json::from_str::<PersistedRobots>(&text) {
+                for (origin, rules) in persisted.entries {
+                    if now_secs().saturating_sub(rules.ts) > ROBOTS_TTL_SECS {
+                        continue;
+                    }
+                    if cache.rules.insert(origin.clone(), rules).is_none() {
+                        cache.order.push_back(origin);
+                    }
+                }
+            }
+        }
+        cache.persist_path = Some(path);
+    }
+
+    /// Merge-write the cache to the shared file. Atomic rename keeps
+    /// concurrent readers consistent; a racing writer can lose another
+    /// process's newest entry, which only costs one extra robots fetch.
+    fn persist(&self) {
+        let (path, entries) = {
+            let cache = self.cache.read().unwrap();
+            let Some(path) = cache.persist_path.clone() else { return };
+            (path, cache.rules.clone())
+        };
+        // Reload under the same path so entries another process added since
+        // our load survive, then merge ours over them.
+        let mut merged: HashMap<String, RobotsRules> = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str::<PersistedRobots>(&text)
+                .map(|p| p.entries)
+                .unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+        for (origin, rules) in entries {
+            merged.insert(origin, rules);
+        }
+        let body = match serde_json::to_string(&PersistedRobots { entries: merged }) {
+            Ok(body) => body,
+            Err(_) => return,
+        };
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     #[cfg(test)]
@@ -50,8 +146,13 @@ impl RobotsCache {
         self.cache.read().unwrap().rules.len()
     }
 
+    /// True only for a fresh entry: a stale one (past the shared-file TTL)
+    /// behaves like a miss so the caller refetches the body.
     pub fn contains(&self, origin: &str) -> bool {
-        self.cache.read().unwrap().rules.contains_key(origin)
+        let cache = self.cache.read().unwrap();
+        cache.rules.get(origin).is_some_and(|rules| {
+            now_secs().saturating_sub(rules.ts) <= ROBOTS_TTL_SECS
+        })
     }
 
     pub fn is_allowed(&self, domain: &str, path: &str) -> bool {
@@ -170,7 +271,7 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
         }
     }
 
-    RobotsRules { disallowed, allowed }
+    RobotsRules { disallowed, allowed, ts: 0 }
 }
 
 fn path_matches(path: &str, pattern: &str) -> bool {

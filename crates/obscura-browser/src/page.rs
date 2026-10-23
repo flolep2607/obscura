@@ -3499,6 +3499,13 @@ impl Page {
         if self.context.obey_robots {
             if url.scheme() == "http" || url.scheme() == "https" {
                 let origin = url.origin().ascii_serialization();
+                // With a storage dir the robots cache is shared with sibling
+                // processes through robots-cache.json, so the whole pod
+                // fetches one site's robots.txt once per TTL instead of once
+                // per worker.
+                if let Some(dir) = &self.context.storage_dir {
+                    self.context.robots_cache.enable_persistence(dir);
+                }
                 if !self.context.robots_cache.contains(&origin) {
                     let mut robots_url = url.clone();
                     robots_url.set_path("/robots.txt");
