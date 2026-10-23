@@ -61,6 +61,10 @@ base64 = "0.22"
 [patch.crates-io]
 # Keep the grid shrink-to-fit correction local until it lands upstream.
 taffy = { path = "vendor/taffy" }
+# html5ever with servo#800: the tree builder's stack-of-open-elements
+# searches (scope checks, insertion-mode resets) are quadratic in nesting
+# depth; deep-but-valid documents parse in minutes instead of milliseconds.
+html5ever = { path = "vendor/html5ever" }
 # Carry the same canonical variable-font coordinates through shaping and
 # rasterization until the upstream API exposes them.
 cosmic-text = { path = "vendor/cosmic-text" }

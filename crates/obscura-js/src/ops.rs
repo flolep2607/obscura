@@ -2760,7 +2760,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             // names, where document order matters for the HTMLCollection,
             // fall back to the walk.
             let (indexed, needs_walk) = dom.window_named_candidates(&arg1);
-            let mut matches = if !needs_walk {
+            let matches = if !needs_walk {
                 indexed
                     .into_iter()
                     .map(|(nid, named_frame)| (nid.index(), named_frame))
