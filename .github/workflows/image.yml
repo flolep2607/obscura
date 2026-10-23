@@ -14,6 +14,8 @@ on:
 permissions:
   contents: read
   packages: write
+  # write for the sccache (actions/cache) and buildx GHA cache backends.
+  actions: write
 
 concurrency:
   group: image-${{ github.ref }}
@@ -55,9 +57,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake clang libclang-dev llvm-dev
 
+      # rust-cache restores the per-flavor target dir (link artifacts, build
+      # scripts); sccache below additionally shares compiled units ACROSS
+      # flavors, so V8/tokio/BoringSSL compile once no matter which flavor
+      # gets there first.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: image-${{ matrix.cache || matrix.flavor }}
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Accept invalid certificates
         if: matrix.insecure_tls
@@ -68,6 +76,11 @@ jobs:
       - name: Build
         env:
           FEATURES: ${{ matrix.features }}
+          RUSTC_WRAPPER: sccache
+          # Share the BoringSSL cmake compile through sccache too.
+          CMAKE_C_COMPILER_LAUNCHER: sccache
+          CMAKE_CXX_COMPILER_LAUNCHER: sccache
+          SCCACHE_GHA_ENABLED: 'true'
         run: cargo build --release -p obscura-cli --bins --no-default-features --features "$FEATURES"
 
       - name: Build and push image
@@ -88,9 +101,12 @@ jobs:
           CMD ["serve", "--port", "9222", "--host", "0.0.0.0"]
           EOF
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build image \
+          # GHA cache backend for the image layers (base image pull etc.).
+          docker buildx create --use --name image-builder 2>/dev/null || docker buildx use image-builder
+          docker buildx build image \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            -t "$image:$branch-$FLAVOR" -t "$image:sha-${GITHUB_SHA}-$FLAVOR"
-          docker push "$image:$branch-$FLAVOR"
-          docker push "$image:sha-${GITHUB_SHA}-$FLAVOR"
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            -t "$image:$branch-$FLAVOR" -t "$image:sha-${GITHUB_SHA}-$FLAVOR" \
+            --push
