@@ -898,6 +898,13 @@ fn process_resource_loader() -> &'static std::sync::Mutex<ResourceLoaderState> {
     PROCESS_RESOURCE_LOADER.get_or_init(|| std::sync::Mutex::new(ResourceLoaderState::default()))
 }
 
+/// Test-only: wipe the process-wide sub-resource cache to simulate a fresh
+/// process (used by the shared-cache tests to prove a fetch came from Redis).
+#[cfg(all(test, feature = "redis-cache"))]
+pub(crate) fn clear_process_resource_cache_for_tests() {
+    process_resource_loader().lock().unwrap().cache = ResourceCache::default();
+}
+
 const RESOURCE_CACHE_MAX_ENTRIES: usize = 256;
 const RESOURCE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
@@ -1518,6 +1525,52 @@ impl ObscuraHttpClient {
                     sender,
                     finished: false,
                 };
+                // Fleet-wide sharing (feature `redis-cache`): before the wire,
+                // ask the other pods through Redis. One lookup per coalesced
+                // group; every failure mode degrades to a normal fetch.
+                #[cfg(feature = "redis-cache")]
+                let shared = crate::shared_cache::shared_asset_cache().await.map(|cache| {
+                    (
+                        cache,
+                        crate::shared_cache::shared_cache_key(
+                            url.as_str(),
+                            &cache_key.user_agent,
+                            &format!("{:?}", cache_key.resource_type),
+                            &format!("{:?}", cache_key.credentials),
+                        ),
+                    )
+                });
+                #[cfg(feature = "redis-cache")]
+                if let Some((cache, ref key)) = shared {
+                    if let Some(entry) = cache.lookup(key).await {
+                        if let Some(remaining) =
+                            crate::shared_cache::shared_entry_remaining(&entry)
+                        {
+                            let response = Response {
+                                url: url.clone(),
+                                status: entry.status,
+                                headers: entry.headers.into_iter().collect(),
+                                body: entry.body,
+                                redirected_from: Vec::new(),
+                            };
+                            process_resource_loader()
+                                .lock()
+                                .unwrap()
+                                .cache
+                                .insert(cache_key, response.clone(), remaining);
+                            leader.finish(SharedFetchOutcome::Cacheable(response.clone()));
+                            self.fire_logical_resource_callbacks(
+                                callbacks, url, &request, &response,
+                            )
+                            .await;
+                            tracing::debug!(
+                                "Shared asset cache hit, body spared: {}",
+                                response.body.len()
+                            );
+                            return Ok(response);
+                        }
+                    }
+                }
                 let result = self
                     .fetch_with_profile_uncached(
                         initial_method,
@@ -1536,6 +1589,19 @@ impl ObscuraHttpClient {
                                 response.clone(),
                                 lifetime,
                             );
+                            // Offer the body to the rest of the fleet. Only
+                            // origins that said `public` are shared, and the
+                            // write never blocks the page.
+                            #[cfg(feature = "redis-cache")]
+                            if let Some((cache, key)) = shared {
+                                if response.body.len() <= cache.max_body_bytes() {
+                                    if let Some(entry) =
+                                        crate::shared_cache::shared_entry_for(response)
+                                    {
+                                        cache.store(key, entry);
+                                    }
+                                }
+                            }
                             SharedFetchOutcome::Cacheable(response.clone())
                         }
                         None => SharedFetchOutcome::RetryUncoalesced,

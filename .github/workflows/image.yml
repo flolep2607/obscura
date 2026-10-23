@@ -28,16 +28,16 @@ jobs:
       matrix:
         include:
           - flavor: stealth
-            features: stealth
+            features: stealth,redis-cache
           # Same build with the default HTTP client accepting invalid
           # certificates, for deployments that must reach misconfigured sites.
           # Not for general use: it disables TLS verification on that client.
           - flavor: stealth-insecure-tls
-            features: stealth
+            features: stealth,redis-cache
             cache: stealth
             insecure_tls: true
           - flavor: render-stealth
-            features: render,stealth
+            features: render,stealth,redis-cache
           - flavor: plain
             features: ''
           - flavor: render

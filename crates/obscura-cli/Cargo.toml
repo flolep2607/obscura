@@ -17,6 +17,8 @@ path = "src/worker.rs"
 default = []
 stealth = ["obscura-browser/stealth", "obscura-net/stealth", "obscura-mcp/stealth"]
 render = ["obscura-browser/render", "obscura-cdp/render", "obscura-mcp/render"]
+# rb-only: fleet-wide asset cache in Redis (see obscura-net/src/shared_cache.rs).
+redis-cache = ["obscura-net/redis-cache"]
 
 [dependencies]
 obscura-browser = { workspace = true }

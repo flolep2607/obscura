@@ -8,6 +8,9 @@ repository.workspace = true
 [features]
 default = []
 stealth = ["wreq", "wreq-util", "futures-util", "webpki-root-certs"]
+# Fleet-wide asset cache in Redis. Off by default: upstream releases do not
+# carry a Redis dependency. rb-all enables it on the stealth image flavors.
+redis-cache = ["dep:redis"]
 
 [dependencies]
 obscura-ssrf = { workspace = true }
@@ -38,6 +41,9 @@ webpki-root-certs = { version = "1", optional = true }
 # newer, incompatible rc and broke `cargo build --features stealth` (issue #234).
 # Pin exact versions so the build always resolves to the API wreq_client.rs targets.
 wreq-util = { version = "=3.0.0-rc.12", optional = true, features = ["emulation-compression"] }
+# Async RESP client with a self-healing connection; no TLS (Redis here is
+# cluster-internal, and pulling rustls stacks doubles the link size).
+redis = { version = "1.8.0", default-features = false, features = ["tokio-comp", "connection-manager"], optional = true }
 
 [dev-dependencies]
 socket2 = "0.6"

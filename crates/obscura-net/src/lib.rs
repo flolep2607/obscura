@@ -7,6 +7,8 @@ pub mod robots;
 pub mod blocklist;
 #[cfg(feature = "stealth")]
 pub mod wreq_client;
+#[cfg(feature = "redis-cache")]
+pub(crate) mod shared_cache;
 
 pub use aia::send_with_aia;
 pub use client::{
