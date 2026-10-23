@@ -3514,11 +3514,14 @@ impl Page {
         if self.context.obey_robots {
             if url.scheme() == "http" || url.scheme() == "https" {
                 let origin = url.origin().ascii_serialization();
-                // With a storage dir the robots cache is shared with sibling
+                // With a robots cache dir the cache is shared with sibling
                 // processes through robots-cache.json, so the whole pod
                 // fetches one site's robots.txt once per TTL instead of once
-                // per worker.
-                if let Some(dir) = &self.context.storage_dir {
+                // per worker. Keyed off `--robots-cache-dir`, not
+                // `--storage-dir`: the storage dir implies shared cookies
+                // and localStorage, which a multi-worker deployment usually
+                // does not want.
+                if let Some(dir) = &self.context.robots_cache_dir {
                     self.context.robots_cache.enable_persistence(dir);
                 }
                 if !self.context.robots_cache.contains(&origin) {

@@ -77,10 +77,11 @@ impl RobotsCache {
         }
     }
 
-    /// Share this cache through `{storage_dir}/robots-cache.json`: entries
-    /// are loaded once and every newly fetched origin is merged back, so
-    /// sibling processes and recycled workers stop refetching robots.txt for
-    /// the same site. Idempotent; safe to call on every navigation.
+    /// Share this cache through `{robots_cache_dir}/robots-cache.json`:
+    /// entries are loaded once and every newly fetched origin is merged
+    /// back, so sibling processes and recycled workers stop refetching
+    /// robots.txt for the same site. Idempotent; safe to call on every
+    /// navigation.
     pub fn enable_persistence(&self, dir: &std::path::Path) {
         {
             let cache = self.cache.read().unwrap();
@@ -368,5 +369,63 @@ mod tests {
         cache.parse_and_store("big.test", &body, "Obscura");
         assert!(!cache.is_allowed("big.test", "/early"));
         assert!(cache.is_allowed("big.test", "/late"));
+    }
+
+    fn temp_robots_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "obscura-robots-test-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // The shared-cache contract: a second cache pointed at the same dir sees
+    // the first one's entries without refetching, which is what lets 50 serve
+    // workers fetch a site's robots.txt once per TTL instead of 50 times.
+    #[test]
+    fn persistence_round_trips_between_cache_instances() {
+        let dir = temp_robots_dir("round-trip");
+        let first = RobotsCache::new();
+        first.enable_persistence(&dir);
+        first.parse_and_store(
+            "shared.test",
+            "User-agent: *\nDisallow: /private\n",
+            "Obscura",
+        );
+        assert!(dir.join("robots-cache.json").exists());
+
+        let second = RobotsCache::new();
+        second.enable_persistence(&dir);
+        assert!(second.contains("shared.test"));
+        assert!(!second.is_allowed("shared.test", "/private"));
+        assert!(second.is_allowed("shared.test", "/public"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A stale entry is a miss, so a long-lived deployment cannot get stuck on
+    // rules whose site changed them days ago.
+    #[test]
+    fn persisted_entries_past_the_ttl_behave_like_a_miss() {
+        let dir = temp_robots_dir("ttl");
+        let dir_copy = dir.clone();
+        let cache = RobotsCache::new();
+        cache.enable_persistence(&dir);
+        cache.parse_and_store("stale.test", "User-agent: *\nDisallow: /\n", "Obscura");
+        // Age the persisted entry past the TTL, then reload it in a fresh
+        // cache like a recycled worker would.
+        let path = dir_copy.join("robots-cache.json");
+        let mut persisted: PersistedRobots =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for rules in persisted.entries.values_mut() {
+            rules.ts = now_secs() - ROBOTS_TTL_SECS - 1;
+        }
+        std::fs::write(&path, serde_json::to_string(&persisted).unwrap()).unwrap();
+
+        let reloaded = RobotsCache::new();
+        reloaded.enable_persistence(&dir_copy);
+        assert!(!reloaded.contains("stale.test"));
+        let _ = std::fs::remove_dir_all(&dir_copy);
     }
 }
