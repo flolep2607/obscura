@@ -1884,13 +1884,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1907,8 +1912,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -2713,13 +2718,22 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         "window_named_names" => {
             let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
             let mut names = Vec::new();
-            let mut seen = HashSet::new();
-            for node in std::iter::once(root).chain(dom.descendants(root)) {
-                dom.with_node(node, |node| {
-                    for name in window_named_attributes(node).into_iter().flatten() {
-                        if seen.insert(name.to_string()) { names.push(name.to_string()); }
-                    }
-                });
+            let document_wide = root == dom.document()
+                || dom.with_node(root, |n| n.parent) == Some(Some(dom.document()));
+            if document_wide {
+                // The document-wide index already tracks every live name;
+                // no tree walk needed. JS turns this into a Set, so the
+                // index's unordered output is equivalent.
+                names = dom.window_named_names();
+            } else {
+                let mut seen = HashSet::new();
+                for node in std::iter::once(root).chain(dom.descendants(root)) {
+                    dom.with_node(node, |node| {
+                        for name in window_named_attributes(node).into_iter().flatten() {
+                            if seen.insert(name.to_string()) { names.push(name.to_string()); }
+                        }
+                    });
+                }
             }
             serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
         }
@@ -2728,29 +2742,48 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // interceptor without paying for a JSON array of every name.
         "window_named_count" => {
             let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
-            let mut seen = HashSet::new();
-            for node in std::iter::once(root).chain(dom.descendants(root)) {
-                dom.with_node(node, |node| {
-                    for name in window_named_attributes(node).into_iter().flatten() {
-                        seen.insert(name.to_string());
-                    }
-                });
+            let document_wide = root == dom.document()
+                || dom.with_node(root, |n| n.parent) == Some(Some(dom.document()));
+            if document_wide {
+                dom.window_named_names().len().to_string()
+            } else {
+                let mut seen = HashSet::new();
+                for node in std::iter::once(root).chain(dom.descendants(root)) {
+                    dom.with_node(node, |node| {
+                        for name in window_named_attributes(node).into_iter().flatten() {
+                            seen.insert(name.to_string());
+                        }
+                    });
+                }
+                seen.len().to_string()
             }
-            seen.len().to_string()
         }
         "window_named_candidates" => {
             if arg1.is_empty() { return "[]".into(); }
-            let mut matches = Vec::new();
-            for node_id in dom.descendants(dom.document()) {
-                dom.with_node(node_id, |node| {
-                    let names = window_named_attributes(node);
-                    if names.contains(&Some(arg1.as_str())) {
-                        let named_frame = names[1] == Some(arg1.as_str())
-                            && node.as_element().is_some_and(|tag| tag.local.as_ref() == "iframe");
-                        matches.push((node_id.index(), named_frame));
+            // The native index resolves the common single-candidate case
+            // (and unknown names) without walking the tree; only duplicate
+            // names, where document order matters for the HTMLCollection,
+            // fall back to the walk.
+            let (indexed, needs_walk) = dom.window_named_candidates(&arg1);
+            let mut matches = if !needs_walk {
+                indexed
+                    .into_iter()
+                    .map(|(nid, named_frame)| (nid.index(), named_frame))
+                    .collect::<Vec<_>>()
+            } else {
+                    let mut walked = Vec::new();
+                    for node_id in dom.descendants(dom.document()) {
+                        dom.with_node(node_id, |node| {
+                            let names = window_named_attributes(node);
+                            if names.contains(&Some(arg1.as_str())) {
+                                let named_frame = names[1] == Some(arg1.as_str())
+                                    && node.as_element().is_some_and(|tag| tag.local.as_ref() == "iframe");
+                                walked.push((node_id.index(), named_frame));
+                            }
+                        });
                     }
-                });
-            }
+                    walked
+                };
             serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into())
         }
         "document_node_id" => dom.document().index().to_string(),
@@ -3046,8 +3079,17 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         .flatten();
                     dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
                     dom.update_id_index(node_id, old_id.as_deref(), Some(value));
+                    dom.update_window_named_index(node_id, "id", old_id.as_deref(), Some(value));
                 } else {
-                    dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
+                    if name == "name" {
+                        let old_name = dom
+                            .with_node(node_id, |n| n.get_attribute("name").map(|s| s.to_string()))
+                            .flatten();
+                        dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
+                        dom.update_window_named_index(node_id, "name", old_name.as_deref(), Some(value));
+                    } else {
+                        dom.with_node_mut(node_id, |n| n.set_attribute(name, value.to_string()));
+                    }
                 }
             }
             "true".into()
@@ -3122,6 +3164,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             } else {
                 None
             };
+            let old_name = if arg2 == "name" {
+                dom.with_node(node_id, |n| n.get_attribute("name").map(str::to_owned))
+                    .flatten()
+            } else {
+                None
+            };
             dom.with_node_mut(node_id, |n| {
                 if let NodeData::Element { attrs, .. } = &mut n.data {
                     attrs.retain(|a| !a.qualified_name_eq(&arg2));
@@ -3129,6 +3177,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             });
             if arg2 == "id" {
                 dom.update_id_index(node_id, old_id.as_deref(), None);
+                dom.update_window_named_index(node_id, "id", old_id.as_deref(), None);
+            } else if arg2 == "name" {
+                dom.update_window_named_index(node_id, "name", old_name.as_deref(), None);
             }
             "true".into()
         }
@@ -3165,6 +3216,15 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                         n.set_attribute_ns(ns, qualified, value.to_string())
                     });
                     dom.update_id_index(node_id, old_id.as_deref(), Some(value));
+                    dom.update_window_named_index(node_id, "id", old_id.as_deref(), Some(value));
+                } else if ns.is_empty() && local == "name" {
+                    let old_name = dom
+                        .with_node(node_id, |n| n.get_attribute("name").map(str::to_owned))
+                        .flatten();
+                    dom.with_node_mut(node_id, |n| {
+                        n.set_attribute_ns(ns, qualified, value.to_string())
+                    });
+                    dom.update_window_named_index(node_id, "name", old_name.as_deref(), Some(value));
                 } else {
                     dom.with_node_mut(node_id, |n| {
                         n.set_attribute_ns(ns, qualified, value.to_string())
@@ -3183,6 +3243,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     .flatten();
                 dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
                 dom.update_id_index(node_id, old_id.as_deref(), None);
+                dom.update_window_named_index(node_id, "id", old_id.as_deref(), None);
+            } else if ns.is_empty() && local == "name" {
+                let old_name = dom
+                    .with_node(node_id, |n| n.get_attribute("name").map(str::to_owned))
+                    .flatten();
+                dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
+                dom.update_window_named_index(node_id, "name", old_name.as_deref(), None);
             } else {
                 dom.with_node_mut(node_id, |n| n.remove_attribute_ns(ns, local));
             }
@@ -7002,7 +7069,10 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
