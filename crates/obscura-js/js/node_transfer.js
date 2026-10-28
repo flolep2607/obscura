@@ -2,10 +2,15 @@
 // dispatch native members through their current owner's captured implementations.
 const _adoptedNodeRoutes = new WeakMap();
 const _nodeNativeMembers = new Map();
+// Retain dispatch intrinsics before page scripts can replace them.
+const _nodeDispatchApply = Reflect.apply;
+const _adoptedNodeRouteGet = _adoptedNodeRoutes.get.bind(_adoptedNodeRoutes);
+const _adoptedNodeRouteSet = _adoptedNodeRoutes.set.bind(_adoptedNodeRoutes);
+const _nodeNativeMemberGet = _nodeNativeMembers.get.bind(_nodeNativeMembers);
 let _hasAdoptedNodeRoutes = false;
 
 function _nodeNativeFrame(node) {
-  const route = _adoptedNodeRoutes.get(node);
+  const route = _adoptedNodeRouteGet(node);
   if (route) return __obscuraCore.ops.op_node_owner_frame(node);
   if (_cache.get(node._nid) === node) return _realmFrameId;
   return __obscuraCore.ops.op_node_owner_frame(node);
@@ -34,7 +39,7 @@ function _observeNodeOwner(observer, node) {
   if (_nodeNativeFrame(node) === _realmFrameId) return;
   const register = __obscuraCore.ops.op_node_owner_member(node, 'registerNodeObserver');
   if (!register) throw new DOMException('The observed document is no longer available.', 'InvalidStateError');
-  Reflect.apply(register, null, [observer]);
+  _nodeDispatchApply(register, null, [observer]);
 }
 function _disconnectNodeObservers(observer) {
   for (const registry of observer._nodeRegistries || []) {
@@ -72,7 +77,7 @@ function _nodeAdoptionSource(ids) {
   const observers = globalThis.__mutationObservers.filter(observer =>
     observer._targets.some(registration => moved.has(registration.target)));
   const records = nodes.map(node => ({ node, oldId: node._nid,
-    route: _adoptedNodeRoutes.get(node) || {},
+    route: _adoptedNodeRouteGet(node) || {},
     listeners: _eventTargetListeners.get(node),
     listenerChanged: _eventTargetListenerChanged.get(node),
     style: _elementStyleGet(node),
@@ -86,7 +91,7 @@ function _nodeAdoptionSource(ids) {
         _detachStyleSheet(record.node);
         _detachLinkedStyleSheet(record.node);
         _cache.delete(record.oldId);
-        _adoptedNodeRoutes.set(record.node, record.route);
+        _adoptedNodeRouteSet(record.node, record.route);
       }
       _hasAdoptedNodeRoutes = true;
       _treeMutationEpoch++; _domMutationEpoch++;
@@ -109,9 +114,9 @@ function _nodeAdoptionSource(ids) {
 
 const _nodeAdoptionTarget = Object.freeze({
   invoke(key, node, args) {
-    const member = _nodeNativeMembers.get(key);
+    const member = _nodeNativeMemberGet(key);
     if (!member) throw new DOMException('The native node operation is unavailable.', 'InvalidStateError');
-    return Reflect.apply(member, node, args);
+    return _nodeDispatchApply(member, node, args);
   },
   registerObserver: _registerNodeObserver,
   install(records, mapping, root, document) {
@@ -126,7 +131,7 @@ const _nodeAdoptionTarget = Object.freeze({
       node._nodeDocument = undefined;
       record.route.frame = _realmFrameId;
       record.route.invoke = _nodeAdoptionTarget.invoke;
-      _adoptedNodeRoutes.set(node, record.route);
+      _adoptedNodeRouteSet(node, record.route);
       _cache.set(node._nid, node);
       if (record.listeners) _eventTargetListeners.set(node, record.listeners);
       if (record.listenerChanged) _eventTargetListenerChanged.set(node, record.listenerChanged);
@@ -143,7 +148,7 @@ function _adoptAcrossDocuments(document, node) {
   const ids = _adoptionPlan(node);
   const prepare = __obscuraCore.ops.op_node_owner_member(node, 'nodeAdoptionSource');
   if (!prepare) throw new DOMException('The source document is no longer available.', 'InvalidStateError');
-  const source = Reflect.apply(prepare, node, [ids]);
+  const source = _nodeDispatchApply(prepare, node, [ids]);
   const result = JSON.parse(__obscuraCore.ops.op_adopt_node(node, node._nid >>> 0, _realmFrameId, source.bindings));
   if (result.error) throw new DOMException('The subtree cannot be adopted into this document.', result.error);
   source.finish(result.mapping, _nodeAdoptionTarget, document);
@@ -167,14 +172,14 @@ function _installAdoptedNodeDispatch() {
         const key = name + ':' + String(property) + ':' + kind;
         _nodeNativeMembers.set(key, member);
         descriptor[kind] = ({ invoke(...args) {
-          const route = _hasAdoptedNodeRoutes && _adoptedNodeRoutes.get(this);
+          const route = _hasAdoptedNodeRoutes && _adoptedNodeRouteGet(this);
           if (route) {
             if (__obscuraCore.ops.op_node_owner_frame(this) < 0) {
               throw new DOMException('The owning document is no longer available.', 'InvalidStateError');
             }
             if (route.frame !== _realmFrameId) return route.invoke(key, this, args);
           }
-          return Reflect.apply(member, this, args);
+          return _nodeDispatchApply(member, this, args);
         } }).invoke;
         Object.defineProperties(descriptor[kind], {
           name: { value: member.name, configurable: true },

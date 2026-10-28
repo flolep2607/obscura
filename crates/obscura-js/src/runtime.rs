@@ -7296,7 +7296,7 @@ mod tests {
     #[test]
     fn first_element_style_access_ignores_replaced_page_intrinsics() {
         let mut rt = setup_runtime("<html><body>Style</body></html>");
-        assert_eq!(rt.evaluate(r#"(() => {
+        assert_eq!(rt.evaluate_script(r#"(() => {
             const element = document.body;
             const original = [globalThis.Proxy, Object.defineProperty,
                 WeakMap.prototype.get, WeakMap.prototype.set, Reflect.apply];
