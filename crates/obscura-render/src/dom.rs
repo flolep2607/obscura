@@ -6680,10 +6680,11 @@ fn layout_dom_once(
                 // A native textarea's intrinsic border box comes from the
                 // rows/cols content attributes (HTML defaults 2 and 20), not
                 // from its text content: an empty textarea is still a
-                // visible, clickable control (Chromium cols=20 rows=2 ->
-                // 168x36, rows=8 -> 126 tall). Per-column width is the
-                // fixed-pitch average advance calibrated to Chromium's
-                // control metrics; per-row height is the normal line height.
+                // visible, clickable control. Round the fixed-pitch column
+                // advance up, then reserve the classic scrollbar width for
+                // auto/scroll overflow, even when no scrollbar is painted.
+                // Default cols=20 rows=2 gives 181x36; hidden overflow gives
+                // 166x36. Per-row height is the normal line height.
                 let rows = node
                     .get_attribute("rows")
                     .and_then(|value| value.trim().parse::<usize>().ok())
@@ -6703,7 +6704,17 @@ fn layout_dom_once(
                     + style.padding.bottom
                     + style.border.top
                     + style.border.bottom;
-                let intrinsic_width = cols * font_size * 0.6075 + horizontal_edges;
+                let (_, overflow_y) = crate::style::computed_overflow_axes(style);
+                let scrollbar_width = if matches!(
+                    overflow_y,
+                    crate::style::OVERFLOW_AUTO | crate::style::OVERFLOW_SCROLL
+                ) {
+                    CLASSIC_SCROLLBAR_GUTTER
+                } else {
+                    0.0
+                };
+                let intrinsic_width =
+                    (cols * font_size * 0.6).ceil() + scrollbar_width + horizontal_edges;
                 let intrinsic_height =
                     crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
                 assign_native_control_size(
@@ -22441,23 +22452,28 @@ mod tests {
     fn textarea_intrinsic_box_comes_from_rows_and_cols() {
         // #685: an empty textarea must keep a real control box instead of
         // laying out as a plain block. Chromium calibrates cols=20/rows=2 to
-        // a 168x36 border box with one 15px control line per row.
+        // a 181x36 border box with one 15px control line per row.
         let tree = parse_html(
             r#"<style>html, body { margin: 0 }</style>
             <div><textarea id="plain"></textarea></div>
             <div><textarea id="rows8" rows="8"></textarea></div>
             <div><textarea id="cssheight" style="height: 36px"></textarea></div>
-            <div><textarea id="invalid-rows" rows="0"></textarea></div>"#,
+            <div><textarea id="invalid-rows" rows="0"></textarea></div>
+            <div><textarea id="auto" style="overflow:auto"></textarea></div>
+            <div><textarea id="scroll" style="overflow:scroll"></textarea></div>
+            <div><textarea id="hidden" style="overflow:hidden"></textarea></div>
+            <div><textarea id="clip" style="overflow:clip"></textarea></div>
+            <div><textarea id="visible" style="overflow:visible"></textarea></div>"#,
         );
         let laid = layout_dom(&tree, (1280.0, 720.0));
         let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
 
         let plain = rect("plain");
-        assert!((plain.width - 168.0).abs() < 0.5, "{}", plain.width);
+        assert!((plain.width - 181.0).abs() < 0.5, "{}", plain.width);
         assert!((plain.height - 36.0).abs() < 0.5, "{}", plain.height);
 
         let rows8 = rect("rows8");
-        assert!((rows8.width - 168.0).abs() < 0.5);
+        assert!((rows8.width - 181.0).abs() < 0.5);
         assert!((rows8.height - 126.0).abs() < 0.5, "{}", rows8.height);
 
         // Author height wins over the rows-derived intrinsic height, and the
@@ -22473,6 +22489,16 @@ mod tests {
         // back to the HTML defaults (rows=2).
         let invalid = rect("invalid-rows");
         assert!((invalid.height - 36.0).abs() < 0.5, "{}", invalid.height);
+
+        // Only auto/scroll overflow reserves intrinsic scrollbar width.
+        for (id, expected_width) in [
+            ("auto", 181.0), ("scroll", 181.0), ("hidden", 166.0),
+            ("clip", 166.0), ("visible", 166.0),
+        ] {
+            let control = rect(id);
+            assert!((control.width - expected_width).abs() < 0.5, "{id}: {}", control.width);
+            assert!((control.height - 36.0).abs() < 0.5, "{id}: {}", control.height);
+        }
 
         // The control is an atomic inline-block, not a stretched block.
         let style = &laid.styles[&tree.get_element_by_id("plain").unwrap()];
