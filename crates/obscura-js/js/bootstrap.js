@@ -5467,9 +5467,9 @@ class Element extends Node {
       }
     }
     if (method === 'POST') {
-      __obscuraCore.ops.op_navigate(targetUrl, 'POST', encoded);
+      __obscuraCore.ops.op_navigate(targetUrl, 'POST', encoded, _realmFrameId);
     } else {
-      __obscuraCore.ops.op_navigate(targetUrl, 'GET', '');
+      __obscuraCore.ops.op_navigate(targetUrl, 'GET', '', _realmFrameId);
     }
   }
   reset() {
@@ -7831,7 +7831,7 @@ function __locationNavigate(url, replace) {
     return;
   }
   globalThis.__virtualUrl = r;
-  __obscuraCore.ops.op_navigate(r, 'GET', '');
+  __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId);
 }
 // Location setters (HTML spec): change one component of a copy of the current
 // URL, then navigate to it. Only the fragment setter can stay in-document.
@@ -7868,7 +7868,7 @@ globalThis.location = {
   set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
   assign(url) { __locationNavigate(url, false); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
   replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
@@ -13303,7 +13303,7 @@ globalThis.atob = globalThis.atob || ((s) => {
   let forwardCleared = false;
   const session = () => {
     try {
-      const [start, current, length] = String(__obscuraCore.ops.op_session_history())
+      const [start, current, length] = String(__obscuraCore.ops.op_session_history(_realmFrameId))
         .split(",").map(Number);
       if (length > 0) {
         return {start, current, before: start,
@@ -13429,9 +13429,9 @@ globalThis.atob = globalThis.atob || ((s) => {
         // Another document's entry: the page loads it and moves its cursor.
         const {start, current, before, after} = session();
         if (target < 0 && -target <= before) {
-          __obscuraCore.ops.op_history_traverse(start + target);
+          __obscuraCore.ops.op_history_traverse(start + target, _realmFrameId);
         } else if (target >= stack.length && target - (stack.length - 1) <= after) {
-          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1));
+          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1), _realmFrameId);
         }
         return;
       }
