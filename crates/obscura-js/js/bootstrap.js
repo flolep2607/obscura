@@ -9144,18 +9144,25 @@ if (typeof Response === 'undefined') {
       this._bodyAborted = false;
       this._bodyAbortReason = undefined;
     }
-    _consumeBody() {
+    async _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      const stream = this._bodyStream;
       this._bodyUsed = true;
       if (this._bodyAborted) throw this._bodyAbortReason;
+      if (stream) {
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) {}
+        reader.releaseLock();
+      }
+      return this._fetchBody ? await this._fetchBody.promise : this._bodyBytes;
     }
     get body() {
       if (this._bodyNull) return null;
-      if (this._bodyUsed) throw new TypeError("Body is already consumed");
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
             if (this._bodyAborted) { controller.error(this._bodyAbortReason); return; }
+            if (this._bodyUsed) { controller.close(); return; }
             const deliver = (bytes) => {
               if (bytes.length) controller.enqueue(bytes);
               controller.close();
@@ -9188,10 +9195,10 @@ if (typeof Response === 'undefined') {
       return this._bodyStream;
     }
     get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    async text() { return _decodeBodyWithCharset(await this._consumeBody(), this.headers); }
+    async json() { return JSON.parse(_decodeBodyWithCharset(await this._consumeBody(), this.headers)); }
+    async arrayBuffer() { return _arrayBufferFromBytes(await this._consumeBody()); }
+    async blob() { return new Blob([await this._consumeBody()]); }
     clone() {
       const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {

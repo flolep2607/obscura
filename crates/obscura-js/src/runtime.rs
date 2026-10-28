@@ -19603,14 +19603,42 @@ mod tests {
                         bodyUsed: r.bodyUsed,
                         hasReader: !!(r.body && r.body.getReader),
                     };
-                    const reader = r.body.getReader();
+                    const stream = r.body;
+                    const reader = stream.getReader();
+                    const lockedBody = [r.body === stream, r.body.locked, r.bodyUsed];
                     const first = await reader.read();
                     const second = await reader.read();
                     const chunkText = first.value ? new TextDecoder().decode(first.value) : "";
                     const consumed = r.bodyUsed;
-                    let doubleThrew = false;
-                    try { await r.text(); } catch (e) { doubleThrew = true; }
-                    return { meta, chunkText, done: second.done, consumed, doubleThrew, nullBody: new Response(null).body === null };
+                    const sameBodyAfterRead = r.body === stream;
+                    reader.releaseLock();
+                    const doubleThrew = await r.text().then(() => false, error => error instanceof TypeError);
+                    const methodBodies = [];
+                    const methodValues = [];
+                    for (const method of ["text", "json", "arrayBuffer", "blob"]) {
+                        for (const exposeFirst of [false, true]) {
+                            const response = new Response('{}');
+                            const before = exposeFirst ? response.body : null;
+                            const value = await response[method]();
+                            methodValues.push(method === "arrayBuffer" ? new TextDecoder().decode(value)
+                                : method === "blob" ? await value.text()
+                                : method === "json" ? JSON.stringify(value) : value);
+                            const body = response.body;
+                            const exhausted = await body.getReader().read();
+                            const doubleRead = await response[method]().then(() => false, error => error instanceof TypeError);
+                            methodBodies.push([
+                                before === null || before === body,
+                                response.body === body,
+                                response.bodyUsed,
+                                exhausted.done,
+                                exhausted.value === undefined,
+                                doubleRead,
+                            ]);
+                        }
+                    }
+                    return { meta, chunkText, done: second.done, consumed, doubleThrew,
+                        lockedBody, sameBodyAfterRead, methodBodies, methodValues,
+                        nullBody: new Response(null).body === null };
                 })()"#,
                 true,
                 true,
@@ -19625,6 +19653,10 @@ mod tests {
         assert_eq!(out["done"], true);
         assert_eq!(out["consumed"], true);
         assert_eq!(out["doubleThrew"], true);
+        assert_eq!(out["lockedBody"], serde_json::json!([true, true, true]));
+        assert_eq!(out["sameBodyAfterRead"], true);
+        assert_eq!(out["methodBodies"], serde_json::json!(vec![vec![true; 6]; 8]));
+        assert_eq!(out["methodValues"], serde_json::json!(vec!["{}"; 8]));
         assert_eq!(out["nullBody"], true);
     }
 
