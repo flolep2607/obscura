@@ -309,6 +309,22 @@ async fn repeated_adoption_preserves_owned_state_and_observers_after_id_reuse() 
     ]));
     runtime.run_event_loop_bounded(100).await.unwrap();
     assert_eq!(runtime.evaluate_script("adoptionState.notices.length").unwrap(), 3);
+    runtime.evaluate_script(r#"(() => {
+        globalThis.escapedNode = frame.contentDocument.createElement('p');
+        escapedNode.textContent = 'escaped';
+        document.body.append(escapedNode);
+        frame.srcdoc = '<!doctype html><html><body><p id="fresh">new document</p></body></html>';
+    })()"#).unwrap();
+    runtime.run_event_loop_bounded(100).await.unwrap();
+    assert_eq!(runtime.evaluate_script(r#"(() => {
+        escapedNode.textContent = 'still owned by parent';
+        return [escapedNode.ownerDocument === document, escapedNode.parentNode === document.body,
+            escapedNode.textContent, frame.contentDocument.getElementById('fresh').textContent];
+    })()"#).expect("source-frame navigation must not invalidate a node now owned by the parent"),
+        json!([true,true,"still owned by parent","new document"]));
+    let error = runtime.evaluate_script("adoptionState.input.setAttribute('data-stale', 'yes')")
+        .expect_err("a wrapper owned by the replaced destination document must fail closed");
+    assert!(error.contains("InvalidStateError"), "{error}");
 }
 
 #[tokio::test(flavor = "current_thread")]

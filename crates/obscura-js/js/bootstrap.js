@@ -10820,6 +10820,7 @@ function _replaceAdoptedStyleSheets(root, sheets) {
 }
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
+  configurable: true,
   get() { return _adoptedStyleSheetsFor(this); },
   set(sheets) {
     _replaceAdoptedStyleSheets(this, sheets);
