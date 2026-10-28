@@ -31,7 +31,7 @@ fn owner_key<'s, 'i>(scope: &mut v8::PinScope<'s, 'i>) -> Option<v8::Local<'s, v
 pub(crate) fn owner_context<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
     state: &OpState,
-    receiver: v8::Local<'s, v8::Object>,
+    receiver: v8::Local<v8::Object>,
 ) -> Option<v8::Local<'s, v8::Context>> {
     let key = owner_key(scope)?;
     let binding = receiver.get_private(scope, key)?;
