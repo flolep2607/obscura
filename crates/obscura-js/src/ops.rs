@@ -6296,7 +6296,7 @@ fn op_get_cookies(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// Origin of the calling realm's document. A cross-origin frame must land in
 /// its own origin's bucket rather than the top document's, so this resolves the
 /// realm that made the call instead of reading page state directly.
-fn storage_origin(state: &ObscuraState) -> std::cell::Ref<'_, str> {
+pub(crate) fn storage_origin(state: &ObscuraState) -> std::cell::Ref<'_, str> {
     let cache = state.storage_origin_cache.borrow();
     // Document identity can change without rebuilding the realm.
     if cache.url == state.url && cache.inherited_origin == state.inherited_origin {
@@ -6646,8 +6646,8 @@ fn op_frame_document_ready(
 
 // deno_core owns the context-state and module-map slots. Store traced V8 values
 // after them, not Global handles that would keep the context alive after detach.
-const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
-const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
+pub(crate) const DOCUMENT_MEMBERS_SLOT: i32 = deno_core::MODULE_MAP_SLOT_INDEX + 1;
+pub(crate) const DOCUMENT_OWNER_SLOT: i32 = DOCUMENT_MEMBERS_SLOT + 1;
 
 #[op2(nofast)]
 fn op_register_document_realm(
@@ -6670,17 +6670,18 @@ fn op_register_document_realm(
     }
 }
 
-/// Resolve a borrowed document member from the receiver's creation realm, not
-/// its public prototype, which a membrane is allowed to replace.
+/// Resolve borrowed members from the native owner, including adopted nodes.
+/// Public prototypes may be replaced by a membrane.
 #[op2]
 fn op_document_realm_member<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
+    state: &OpState,
     receiver: v8::Local<'s, v8::Object>,
     #[string] name: &str,
     caller_frame_id: u32,
 ) -> v8::Local<'s, v8::Value> {
     let member = (|| {
-        let context = receiver.get_creation_context(scope)?;
+        let context = crate::node_transfer::owner_context(scope, state, receiver)?;
         let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
         if owner == caller_frame_id { return None; }
         let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
@@ -6691,31 +6692,14 @@ fn op_document_realm_member<'s, 'i>(
     member.unwrap_or_else(|| v8::undefined(scope).into())
 }
 
-// Use native context identity, never a public prototype or a raw node ID, to
-// decide which arena an incoming cross-realm wrapper belongs to.
-fn node_creation_frame(
-    scope: &mut v8::PinScope,
-    state: &OpState,
-    receiver: v8::Local<v8::Object>,
-) -> Option<u32> {
-    let context = receiver.get_creation_context(scope)?;
-    let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?;
-    if !owner.is_uint32() { return None; }
-    let owner = owner.uint32_value(scope)?;
-    if owner == 0 { return Some(0); }
-    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow();
-    let known = registry.context(owner)?;
-    (known == context && registry.frame_timers_active(owner) == Some(true)).then_some(owner)
-}
-
-#[op2]
-fn op_node_creation_frame(
+#[op2(fast)]
+fn op_node_owner_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
     receiver: v8::Local<v8::Object>,
 ) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        node_creation_frame(scope, state, receiver).map_or(-1, |frame| frame as i32)
+        crate::node_transfer::owner_frame(scope, state, receiver).map_or(-1, |frame| frame as i32)
     })).unwrap_or(-1)
 }
 
@@ -6732,7 +6716,7 @@ impl ImportNodeError {
     }
 }
 
-fn live_import_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+pub(crate) fn live_import_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
     if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
     let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow();
     if registry.frame_timers_active(frame_id) != Some(true) { return None; }
@@ -6752,7 +6736,7 @@ fn op_import_node(
     deep: bool,
 ) -> String {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let source_frame = node_creation_frame(scope, state, receiver)
+        let source_frame = crate::node_transfer::owner_frame(scope, state, receiver)
             .ok_or(ImportNodeError::InvalidState)?;
         let source = live_import_state(state, source_frame).ok_or(ImportNodeError::InvalidState)?;
         let target = live_import_state(state, target_frame).ok_or(ImportNodeError::InvalidState)?;
@@ -7899,8 +7883,11 @@ pub fn build_extension() -> Extension {
         op_frame_document_ready(),
         op_initial_frame(),
         op_document_realm_member(),
-        op_node_creation_frame(),
+        op_node_owner_frame(),
         op_import_node(),
+        crate::node_transfer::op_node_owner_member(),
+        crate::node_transfer::op_adoption_nodes(),
+        crate::node_transfer::op_adopt_node(),
         op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),

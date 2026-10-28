@@ -184,36 +184,43 @@ async fn foreign_node_ids_cannot_mutate_an_unrelated_iframe_node() {
         return source._nid === target._nid;
     })()"#).expect("fixture must find a real node-ID collision across native arenas");
     assert_eq!(collision, true);
-    // Until adoption can preserve wrapper ownership, rejecting before mutation
-    // is required. Replace these rejection expectations with identity checks
-    // when the adoption implementation lands; the no-aliasing invariant stays.
-    for expression in [
-        "frame.contentDocument.head.appendChild(aliasSource)",
-        "frame.contentDocument.body.insertBefore(aliasSource, aliasTarget)",
-        "frame.contentDocument.body.replaceChild(aliasSource, aliasTarget)",
-        "frame.contentDocument.head.append('prefix', aliasSource)",
-        "frame.contentDocument.head.prepend(aliasSource)",
-        "frame.contentDocument.head.appendChild(aliasFragment)",
-        "frame.contentDocument.body.replaceChildren(aliasFragment)",
-        "frame.contentDocument.body.replaceChildren('prefix', aliasSource)",
-        "aliasTarget.before(aliasSource)",
-        "aliasTarget.after(aliasSource)",
-        "aliasTarget.replaceWith(aliasSource)",
-        "frame.contentDocument.adoptNode(aliasSource)",
+    for (expression, fragment) in [
+        ("box.appendChild(aliasSource)", false),
+        ("box.insertBefore(aliasSource, aliasTarget)", false),
+        ("box.replaceChild(aliasSource, aliasTarget)", false),
+        ("box.append('prefix', aliasSource)", false),
+        ("box.prepend(aliasSource)", false),
+        ("box.appendChild(aliasFragment)", true),
+        ("box.replaceChildren(aliasFragment)", true),
+        ("box.replaceChildren('prefix', aliasSource)", false),
+        ("aliasTarget.before(aliasSource)", false),
+        ("aliasTarget.after(aliasSource)", false),
+        ("aliasTarget.replaceWith(aliasSource)", false),
+        ("frame.contentDocument.adoptNode(aliasSource)", false),
     ] {
-        let error = runtime.evaluate_script(expression).expect_err("cross-tree mutation must fail before touching either arena");
-        assert!(error.contains("WrongDocumentError"), "{expression}: {error}");
-        assert_eq!(runtime.evaluate_script(r#"(() => {
+        runtime.evaluate_script(r#"(() => {
+            globalThis.box = frame.contentDocument.createElement('div');
+            frame.contentDocument.body.append(box);
+            box.append(aliasTarget);
+            document.body.append(aliasSource);
+            globalThis.fragmentLeaf = document.createElement('span');
+            fragmentLeaf.textContent = 'fragment';
+            globalThis.aliasFragment = document.createDocumentFragment();
+            aliasFragment.append(fragmentLeaf);
+        })()"#).unwrap();
+        runtime.evaluate_script(expression).expect("cross-tree insertion must transfer ownership without aliasing");
+        assert_eq!(runtime.evaluate_script(&format!(r#"(() => {{
+            const moved = {moved};
             const child = frame.contentDocument;
-            return [document.getElementById('alias-source') === aliasSource,
-                aliasSource.parentNode === document.body, aliasSource.textContent,
-                child.getElementById('alias-target') === aliasTarget,
-                aliasTarget.parentNode === child.body, aliasTarget.textContent,
-                child.getElementById('child-sentinel').textContent,
+            return [moved.ownerDocument === child, moved.textContent,
+                aliasTarget.textContent, child.getElementById('child-sentinel').textContent,
+                document.getElementById('host-sentinel').textContent,
                 child.getElementById('target').textContent,
-                child.head.textContent, aliasFragment.childNodes.length];
-        })()"#).unwrap(), json!([true,true,"host",true,true,"child","untouched","child",
-            "#target { width:23px; height:11px }",1]));
+                moved !== aliasTarget, !moved.isSameNode(aliasTarget)];
+        }})()"#, moved = if fragment { "fragmentLeaf" } else { "aliasSource" })).unwrap(),
+            json!([true, if fragment { "fragment" } else { "host" }, "child", "untouched", "parent", "child", true, true]),
+            "{expression}");
+        runtime.evaluate_script("box.remove()").unwrap();
     }
 }
 
@@ -248,4 +255,84 @@ async fn iframe_import_preserves_form_template_and_started_script_state() {
             globalThis.transferScriptRuns, frame.contentWindow.transferScriptRuns || 0,
             stateSource.querySelector('input').indeterminate];
     })()"#).unwrap(), json!([true,true,true,false,"dirty","template-dirty",true,true,0,1,0,true]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_adoption_preserves_owned_state_and_observers_after_id_reuse() {
+    let mut runtime = runtime_with_frame().await;
+    runtime.evaluate_script(r#"(() => {
+        const root = document.createElement('section');
+        root.innerHTML = '<input type="checkbox"><template><input value="default"></template><div></div>';
+        const input = root.querySelector('input');
+        input.checked = true; input.indeterminate = true;
+        const template = root.querySelector('template');
+        const templateInput = template.content.querySelector('input');
+        templateInput.value = 'dirty';
+        const host = root.querySelector('div');
+        const shadow = host.attachShadow({mode:'closed'});
+        const shadowLeaf = document.createElement('span');
+        shadowLeaf.textContent = 'shadow'; shadow.append(shadowLeaf);
+        const style = input.style;
+        style.width = '37px';
+        const notices = [];
+        const observer = new MutationObserver(records => notices.push(...records.map(record =>
+            [record.type, record.target === input, record.attributeName])));
+        observer.observe(input, {attributes:true});
+        document.body.append(root);
+        const oldIds = [root._nid, input._nid, template._nid, templateInput._nid, shadow._nid, shadowLeaf._nid];
+        frame.contentDocument.body.append(root);
+        const replacements = Array.from({length:40}, () => document.createElement('p'));
+        for (const replacement of replacements) { replacement.textContent = 'source'; document.body.append(replacement); }
+        const reused = replacements.some(node => oldIds.includes(node._nid));
+        style.width = '41px'; input.setAttribute('data-moved', 'yes');
+        const first = [root.ownerDocument === frame.contentDocument,
+            root.querySelector('input') === input, input.checked, input.indeterminate,
+            input.style === style, input.style.width, template.content.querySelector('input') === templateInput,
+            templateInput.value, shadowLeaf.ownerDocument === frame.contentDocument, shadow.firstChild === shadowLeaf,
+            replacements.every(node => node.textContent === 'source'), reused];
+        document.body.append(root);
+        frame.contentDocument.body.append(root);
+        input.setAttribute('data-again', 'yes');
+        globalThis.adoptionState = {root, input, templateInput, shadowLeaf, notices, observer, first};
+    })()"#).expect("repeated adoption must preserve the entire owned subtree");
+    runtime.run_event_loop_bounded(100).await.unwrap();
+    assert_eq!(runtime.evaluate_script(r#"(() => {
+        const state = adoptionState;
+        const result = [state.first, state.input.ownerDocument === frame.contentDocument,
+            state.templateInput.value, state.shadowLeaf.textContent, state.notices];
+        state.observer.disconnect();
+        state.input.setAttribute('data-disconnected', 'yes');
+        return result;
+    })()"#).unwrap(), json!([
+        [true,true,true,true,true,"41px",true,"dirty",true,true,true,true],
+        true,"dirty","shadow",[["attributes",true,"style"],["attributes",true,"data-moved"],["attributes",true,"data-again"]]
+    ]));
+    runtime.run_event_loop_bounded(100).await.unwrap();
+    assert_eq!(runtime.evaluate_script("adoptionState.notices.length").unwrap(), 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unsupported_adoption_and_invalid_insertion_leave_source_intact() {
+    let mut runtime = runtime_with_frame().await;
+    runtime.evaluate_script(r#"(() => {
+        globalThis.resourceRoot = document.createElement('section');
+        resourceRoot.append(document.createElement('video'));
+        document.body.append(resourceRoot);
+        globalThis.ordinaryRoot = document.createElement('section');
+        ordinaryRoot.textContent = 'kept'; document.body.append(ordinaryRoot);
+    })()"#).unwrap();
+    for (expression, error_name) in [
+        ("frame.contentDocument.body.append(resourceRoot)", "NotSupportedError"),
+        ("frame.contentDocument.adoptNode(resourceRoot)", "NotSupportedError"),
+        ("frame.contentDocument.body.insertBefore(ordinaryRoot, document.body)", "NotFoundError"),
+        ("frame.contentDocument.appendChild(ordinaryRoot)", "HierarchyRequestError"),
+    ] {
+        let error = runtime.evaluate_script(expression).expect_err("invalid transfer must fail before mutation");
+        assert!(error.contains(error_name), "{expression}: {error}");
+        assert_eq!(runtime.evaluate_script(r#"[resourceRoot.parentNode === document.body,
+            resourceRoot.ownerDocument === document, resourceRoot.firstChild.localName,
+            ordinaryRoot.parentNode === document.body, ordinaryRoot.textContent,
+            frame.contentDocument.getElementById('child-sentinel').textContent]"#).unwrap(),
+            json!([true,true,"video",true,"kept","untouched"]));
+    }
 }

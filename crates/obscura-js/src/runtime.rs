@@ -4619,7 +4619,8 @@ mod tests {
     #[test]
     fn bootstrap_source_uses_ascii_snapshot_storage() {
         let source = include_str!("../js/bootstrap.js")
-            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"))
+            .replace("/* NODE_TRANSFER */", include_str!("../js/node_transfer.js"));
         assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
         if cfg!(obscura_external_bootstrap) {
             assert_eq!(super::SNAPSHOT.windows(source.len())
