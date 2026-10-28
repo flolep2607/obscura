@@ -6691,6 +6691,106 @@ fn op_document_realm_member<'s, 'i>(
     member.unwrap_or_else(|| v8::undefined(scope).into())
 }
 
+// Use native context identity, never a public prototype or a raw node ID, to
+// decide which arena an incoming cross-realm wrapper belongs to.
+fn node_creation_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> Option<u32> {
+    let context = receiver.get_creation_context(scope)?;
+    let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?;
+    if !owner.is_uint32() { return None; }
+    let owner = owner.uint32_value(scope)?;
+    if owner == 0 { return Some(0); }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow();
+    let known = registry.context(owner)?;
+    (known == context && registry.frame_timers_active(owner) == Some(true)).then_some(owner)
+}
+
+#[op2]
+fn op_node_creation_frame(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        node_creation_frame(scope, state, receiver).map_or(-1, |frame| frame as i32)
+    })).unwrap_or(-1)
+}
+
+#[derive(Clone, Copy)]
+enum ImportNodeError { InvalidState, Security, Unsupported }
+
+impl ImportNodeError {
+    fn name(self) -> &'static str {
+        match self {
+            Self::InvalidState => "InvalidStateError",
+            Self::Security => "SecurityError",
+            Self::Unsupported => "NotSupportedError",
+        }
+    }
+}
+
+fn live_import_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
+    let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow();
+    if registry.frame_timers_active(frame_id) != Some(true) { return None; }
+    registry.by_frame_id(frame_id)
+}
+
+/// Import allocates only in the destination arena. Original wrappers and
+/// listeners stay with the source; adoption needs a separate ownership route.
+#[op2]
+#[string]
+fn op_import_node(
+    scope: &mut v8::PinScope,
+    state: &OpState,
+    receiver: v8::Local<v8::Object>,
+    source_nid: u32,
+    target_frame: u32,
+    deep: bool,
+) -> String {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let source_frame = node_creation_frame(scope, state, receiver)
+            .ok_or(ImportNodeError::InvalidState)?;
+        let source = live_import_state(state, source_frame).ok_or(ImportNodeError::InvalidState)?;
+        let target = live_import_state(state, target_frame).ok_or(ImportNodeError::InvalidState)?;
+        let source_nid = NodeId::new(source_nid);
+        if Rc::ptr_eq(&source, &target) {
+            let state = source.borrow();
+            let dom = state.dom.as_ref().ok_or(ImportNodeError::InvalidState)?;
+            if source_nid == dom.document() || dom.is_shadow_root(source_nid) {
+                return Err(ImportNodeError::Unsupported);
+            }
+            let cloned = dom.clone_node(source_nid, deep).ok_or(ImportNodeError::InvalidState)?;
+            propagate_script_start_state(dom, source_nid, cloned, &state.already_started_scripts);
+            return Ok(cloned.raw());
+        }
+        let source = source.borrow();
+        let target = target.borrow();
+        let origin = storage_origin(&source);
+        if &*origin == "null" || &*origin != &*storage_origin(&target) {
+            return Err(ImportNodeError::Security);
+        }
+        let source_dom = source.dom.as_ref().ok_or(ImportNodeError::InvalidState)?;
+        let target_dom = target.dom.as_ref().ok_or(ImportNodeError::InvalidState)?;
+        if source_nid == source_dom.document() || source_dom.is_shadow_root(source_nid) {
+            return Err(ImportNodeError::Unsupported);
+        }
+        let (root, mapping) = target_dom.import_detached_node_from(source_dom, source_nid, deep)
+            .ok_or(ImportNodeError::InvalidState)?;
+        let started = source.already_started_scripts.borrow();
+        target.already_started_scripts.borrow_mut().extend(mapping.into_iter()
+            .filter_map(|(old, new)| started.contains(&old).then_some(new)));
+        Ok(root.raw())
+    })).unwrap_or(Err(ImportNodeError::InvalidState));
+    match result {
+        Ok(nid) => serde_json::json!({"nid": nid}).to_string(),
+        Err(error) => serde_json::json!({"error": error.name()}).to_string(),
+    }
+}
+
 /// Limit live contexts and DOM trees, including initial realms awaiting Page
 /// adoption. Synchronous and fetched frames share the same per-page budget.
 pub fn max_live_frames() -> usize {
@@ -7799,6 +7899,8 @@ pub fn build_extension() -> Extension {
         op_frame_document_ready(),
         op_initial_frame(),
         op_document_realm_member(),
+        op_node_creation_frame(),
+        op_import_node(),
         op_register_document_realm(),
         op_post_frame_message(),
         op_sleep(),

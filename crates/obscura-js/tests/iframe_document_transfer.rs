@@ -164,3 +164,88 @@ async fn iframe_adopt_node_moves_descendants_and_preserves_listeners() {
         "sentinels": ["parent", "untouched", "child"],
     }));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn foreign_node_ids_cannot_mutate_an_unrelated_iframe_node() {
+    let mut runtime = runtime_with_frame().await;
+    let collision = runtime.evaluate_script(r#"(() => {
+        const child = frame.contentDocument;
+        const sources = Array.from({length:32}, () => document.createElement('span'));
+        const targets = Array.from({length:32}, () => child.createElement('p'));
+        const source = sources.find(source => targets.some(target => target._nid === source._nid));
+        const target = targets.find(target => target._nid === source._nid);
+        source.id = 'alias-source'; source.textContent = 'host';
+        target.id = 'alias-target'; target.textContent = 'child';
+        document.body.append(source); child.body.append(target);
+        globalThis.aliasSource = source;
+        globalThis.aliasTarget = target;
+        globalThis.aliasFragment = document.createDocumentFragment();
+        aliasFragment.append(document.createElement('span'));
+        return source._nid === target._nid;
+    })()"#).expect("fixture must find a real node-ID collision across native arenas");
+    assert_eq!(collision, true);
+    // Until adoption can preserve wrapper ownership, rejecting before mutation
+    // is required. Replace these rejection expectations with identity checks
+    // when the adoption implementation lands; the no-aliasing invariant stays.
+    for expression in [
+        "frame.contentDocument.head.appendChild(aliasSource)",
+        "frame.contentDocument.body.insertBefore(aliasSource, aliasTarget)",
+        "frame.contentDocument.body.replaceChild(aliasSource, aliasTarget)",
+        "frame.contentDocument.head.append('prefix', aliasSource)",
+        "frame.contentDocument.head.prepend(aliasSource)",
+        "frame.contentDocument.head.appendChild(aliasFragment)",
+        "frame.contentDocument.body.replaceChildren(aliasFragment)",
+        "frame.contentDocument.body.replaceChildren('prefix', aliasSource)",
+        "aliasTarget.before(aliasSource)",
+        "aliasTarget.after(aliasSource)",
+        "aliasTarget.replaceWith(aliasSource)",
+        "frame.contentDocument.adoptNode(aliasSource)",
+    ] {
+        let error = runtime.evaluate_script(expression).expect_err("cross-tree mutation must fail before touching either arena");
+        assert!(error.contains("WrongDocumentError"), "{expression}: {error}");
+        assert_eq!(runtime.evaluate_script(r#"(() => {
+            const child = frame.contentDocument;
+            return [document.getElementById('alias-source') === aliasSource,
+                aliasSource.parentNode === document.body, aliasSource.textContent,
+                child.getElementById('alias-target') === aliasTarget,
+                aliasTarget.parentNode === child.body, aliasTarget.textContent,
+                child.getElementById('child-sentinel').textContent,
+                child.getElementById('target').textContent,
+                child.head.textContent, aliasFragment.childNodes.length];
+        })()"#).unwrap(), json!([true,true,"host",true,true,"child","untouched","child",
+            "#target { width:23px; height:11px }",1]));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn iframe_import_preserves_form_template_and_started_script_state() {
+    let mut runtime = runtime_with_frame().await;
+    runtime.evaluate_script(r#"(() => {
+        const source = document.createElement('section');
+        source.innerHTML = '<input type="checkbox"><textarea>default</textarea><template><input value="default"></template>';
+        source.querySelector('input').checked = true;
+        source.querySelector('input').indeterminate = true;
+        source.querySelector('textarea').value = 'dirty';
+        source.querySelector('template').content.querySelector('input').value = 'template-dirty';
+        const script = document.createElement('script');
+        script.textContent = 'globalThis.transferScriptRuns = (globalThis.transferScriptRuns || 0) + 1';
+        source.append(script); document.body.append(source);
+        globalThis.stateSource = source;
+        globalThis.stateImport = frame.contentDocument.importNode(source, true);
+        globalThis.shallowImport = frame.contentDocument.importNode(source, false);
+        frame.contentDocument.body.append(stateImport);
+    })()"#).expect("cross-document import must preserve native cloning state");
+    runtime.run_event_loop_bounded(100).await.unwrap();
+    assert_eq!(runtime.evaluate_script(r#"(() => {
+        const child = frame.contentDocument;
+        return [stateImport !== stateSource, stateImport.ownerDocument === child,
+            stateImport.querySelector('input').checked,
+            stateImport.querySelector('input').indeterminate,
+            stateImport.querySelector('textarea').value,
+            stateImport.querySelector('template').content.querySelector('input').value,
+            shallowImport.ownerDocument === child, shallowImport.parentNode === null,
+            shallowImport.childNodes.length,
+            globalThis.transferScriptRuns, frame.contentWindow.transferScriptRuns || 0,
+            stateSource.querySelector('input').indeterminate];
+    })()"#).unwrap(), json!([true,true,true,false,"dirty","template-dirty",true,true,0,1,0,true]));
+}

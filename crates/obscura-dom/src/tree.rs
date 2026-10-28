@@ -1788,74 +1788,72 @@ impl DomTree {
     }
 
     /// Copies a node together with its subtree from `source` and attaches it to `parent_id`.
-    /// Returns the copy of `source_node_id` itself, so that a caller that keeps parsing into
-    /// `source` can map the source to its copy.
     pub fn import_node_from(
         &self,
         parent_id: NodeId,
         source: &DomTree,
         source_node_id: NodeId,
     ) -> Option<NodeId> {
-        // Iterative DFS with an explicit (dest_parent, source_node) stack so a
-        // deeply nested source tree cannot overflow the thread stack and abort
-        // the process. Children are pushed in reverse so they are appended in
-        // document order (append_child always appends to the end, so each level
-        // keeps the source ordering).
-        let mut imported_root = None;
-        let mut stack = vec![(parent_id, source_node_id)];
-        while let Some((dest_parent, src_id)) = stack.pop() {
-            let node_data = {
-                let source_inner = source.inner.borrow();
-                match source_inner.nodes.get(src_id.index()) {
-                    Some(Some(node)) => node.data.clone(),
-                    _ => continue,
-                }
-            };
+        let (root, _) = self.import_detached_node_from(source, source_node_id, true)?;
+        self.append_child(parent_id, root);
+        Some(root)
+    }
 
+    /// Copy into this arena without attaching the root. The mapping includes
+    /// template-content documents, so the caller can remap per-node state.
+    pub fn import_detached_node_from(
+        &self,
+        source: &DomTree,
+        source_node_id: NodeId,
+        deep: bool,
+    ) -> Option<(NodeId, Vec<(NodeId, NodeId)>)> {
+        if source.is_shadow_root(source_node_id) || source.get_node(source_node_id).is_none() {
+            return None;
+        }
+        let mut imported_root = None;
+        let mut mapping = Vec::new();
+        // Iterative traversal also keeps deeply nested template contents off
+        // the Rust call stack. A shallow template gets an empty contents node.
+        let mut stack = vec![(None, source_node_id)];
+        while let Some((dest_parent, src_id)) = stack.pop() {
+            let node_data = source.get_node(src_id)?.data;
             let new_id = self.new_node(node_data);
-            self.append_child(dest_parent, new_id);
-            // The first node off the stack is source_node_id itself.
+            if let Some(parent) = dest_parent {
+                self.append_child(parent, new_id);
+            }
             if imported_root.is_none() {
                 imported_root = Some(new_id);
             }
-
-            // A <template>'s children hang off a separate contents document, so
-            // the child walk below never reaches them. Worse, the cloned data
-            // carries the *source* tree's contents NodeId, which here indexes
-            // whatever unrelated node occupies that slot. Allocate a real
-            // contents node and queue the source contents' children into it, so
-            // the reference is remapped rather than left dangling (issue #463).
-            let src_contents = {
-                let inner = self.inner.borrow();
-                match inner.nodes.get(new_id.index()).and_then(|n| n.as_ref()) {
-                    Some(node) => match &node.data {
-                        NodeData::Element { template_contents, .. } => *template_contents,
-                        _ => None,
-                    },
-                    None => None,
-                }
-            };
+            mapping.push((src_id, new_id));
+            if let Some(mut state) = source.form_control_state(src_id) {
+                state.indeterminate = false;
+                self.update_form_control_state(new_id, |control| *control = state);
+            }
+            let src_contents = source.with_node(src_id, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            }).flatten();
             if let Some(src_contents) = src_contents {
                 let dest_contents = self.new_node(NodeData::Document);
-                {
-                    let mut inner = self.inner.borrow_mut();
-                    if let Some(Some(node)) = inner.nodes.get_mut(new_id.index()) {
-                        if let NodeData::Element { template_contents, .. } = &mut node.data {
-                            *template_contents = Some(dest_contents);
-                        }
+                self.with_node_mut(new_id, |node| {
+                    if let NodeData::Element { template_contents, .. } = &mut node.data {
+                        *template_contents = Some(dest_contents);
+                    }
+                });
+                mapping.push((src_contents, dest_contents));
+                if deep {
+                    for child in source.children(src_contents).into_iter().rev() {
+                        stack.push((Some(dest_contents), child));
                     }
                 }
-                // Onto the same stack, so nested templates stay iterative.
-                for child_id in source.children(src_contents).into_iter().rev() {
-                    stack.push((dest_contents, child_id));
+            }
+            if deep {
+                for child in source.children(src_id).into_iter().rev() {
+                    stack.push((Some(new_id), child));
                 }
             }
-
-            for child_id in source.children(src_id).into_iter().rev() {
-                stack.push((new_id, child_id));
-            }
         }
-        imported_root
+        Some((imported_root?, mapping))
     }
 
     pub fn len(&self) -> usize {

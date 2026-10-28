@@ -2444,6 +2444,23 @@ function _isDomNode(value) {
       && (typeof value._nid === "number" || value._documentShim === true));
 }
 
+// Common same-realm wrappers are identified by the private cache. Foreign
+// prototypes and numeric IDs are not ownership evidence: IDs belong to arenas.
+function _assertSameNativeTree(parent, node, method) {
+  if (_cache.get(parent._nid) === parent && _cache.get(node._nid) === node) return;
+  const parentFrame = __obscuraCore.ops.op_node_creation_frame(parent);
+  const nodeFrame = __obscuraCore.ops.op_node_creation_frame(node);
+  if (parentFrame < 0 || nodeFrame < 0 || parentFrame !== _realmFrameId || nodeFrame !== parentFrame) {
+    throw _mutationError(method, "Cross-document adoption is not supported.", "WrongDocumentError", parent);
+  }
+}
+function _assertInsertionNodes(context, nodes, method) {
+  _assertSameNativeTree(context, context, method);
+  for (const node of nodes) {
+    if (_isDomNode(node)) _assertSameNativeTree(context, node, method);
+  }
+}
+
 function _requireNodeArgument(value, method, position, iface = "Node") {
   if (!_isDomNode(value)) {
     throw new TypeError(
@@ -2488,6 +2505,8 @@ function _isHostIncludingInclusiveAncestor(node, parent) {
 // (`replacing` true). Steps run in the spec's order because the order is
 // observable through which exception is thrown.
 function _ensureInsertionValidity(parent, node, child, method, replacing) {
+  _assertSameNativeTree(parent, node, method);
+  if (child !== null) _assertSameNativeTree(parent, child, method);
   const parentType = parent.nodeType;
   if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
     throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
@@ -2571,6 +2590,7 @@ function _ensureDocumentChildValidity(parent, node, nodeType, child, method, rep
 // argument is collected into a DocumentFragment so the caller inserts once and
 // observers get a single record.
 function _convertNodesIntoNode(nodes, context) {
+  _assertInsertionNodes(context, nodes, "insert");
   if (nodes.length === 1 && _isDomNode(nodes[0])) return nodes[0];
   const owner = _nodeDocumentForInsertion(context);
   const converted = [];
@@ -2591,6 +2611,7 @@ function _convertNodesIntoNode(nodes, context) {
 // same, including the one childList record, without the fragment round trip.
 // Anything else takes the fragment path. `reference` is read after conversion.
 function _preInsertConverted(parent, args, context, reference, method) {
+  _assertInsertionNodes(parent, args, method);
   if (args.length === 1 && _isDomNode(args[0])) return _preInsertNode(parent, args[0], reference(), method);
   const parentType = parent.nodeType;
   if (args.length > 1 && (parentType === 1 || parentType === 11) && !(parent instanceof ShadowRoot)) {
@@ -2660,6 +2681,7 @@ function _hasMutationObservers() {
 
 // "Remove": `suppress` skips the record, as replace/replace-all queue their own.
 function _removeNode(parent, child, suppress, method = "removeChild") {
+  _assertSameNativeTree(parent, child, method);
   const observed = !suppress && _hasMutationObservers();
   const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
   const removedWindowNames = _windowNamedNamesInTree(child);
@@ -2681,6 +2703,7 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
 // that still has a parent is removed from it first, which old-parent
 // observers see as a removal (adopt runs "remove" before inserting).
 function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  _assertSameNativeTree(parent, node, method);
   if (node._shadowParent) {
     node._shadowParent.removeChild(node);
   } else {
@@ -2765,6 +2788,7 @@ function _replaceChildNode(parent, node, child, method) {
 
 // "Replace all" (replaceChildren, textContent). `node` may be null.
 function _replaceAllChildren(parent, node, method) {
+  _assertSameNativeTree(parent, node === null ? parent : node, method);
   const removedNodes = Array.from(parent.childNodes);
   const observed = _hasMutationObservers();
   const addedNodes = node === null ? [] : (node.nodeType === 11 ? Array.from(node.childNodes) : [node]);
@@ -18164,22 +18188,29 @@ if (typeof URLPattern === 'undefined') {
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node) {
     const deep = arguments[1];
+    const method = _documentRealmMember(this, 'importNode');
+    if (method) return Reflect.apply(method, this, [node, deep]);
     _requireNodeArgument(node, "importNode", 1, "Document");
     if (node.nodeType === 9 || node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
     }
-    const clone = node.cloneNode(!!deep);
+    const sourceFrame = __obscuraCore.ops.op_node_creation_frame(node);
+    if (sourceFrame === _realmFrameId) return _stampNodeDocument(node.cloneNode(!!deep), this);
+    const result = JSON.parse(__obscuraCore.ops.op_import_node(node, node._nid >>> 0, _realmFrameId, !!deep));
+    if (result.error) throw new DOMException("The node cannot be imported into this document.", result.error);
+    const clone = node.nodeType === 11 ? new DocumentFragment(result.nid) : _wrap(result.nid);
+    _cache.set(result.nid, clone);
+    _seedDetachedTreeState(clone);
     return _stampNodeDocument(clone, this);
   };
 }
 
-// Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
-// nodes between documents (portals, iframe hand-off) call it; the missing
-// method throws "adoptNode is not a function". With no second document to
-// transfer ownership from, the node is already ours, so return it as-is,
-// matching the observable effect of adoption into this document.
+// Same-arena adoption keeps the wrapper and listener identity. Cross-arena
+// adoption must fail before removal until wrappers can route to their new owner.
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
   Document.prototype.adoptNode = function(node) {
+    const method = _documentRealmMember(this, 'adoptNode');
+    if (method) return Reflect.apply(method, this, [node]);
     _requireNodeArgument(node, "adoptNode", 1, "Document");
     if (node.nodeType === 9) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", "NotSupportedError");
@@ -18187,6 +18218,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
     if (node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a shadow root, which may not be adopted.", "HierarchyRequestError");
     }
+    _assertSameNativeTree(this, node, "adoptNode");
     const parent = node.parentNode;
     if (parent) parent.removeChild(node);
     if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
@@ -18422,7 +18454,7 @@ const _installCaretGeometry = (function _installCaretGeometry() {
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported', 'importNode', 'adoptNode'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
