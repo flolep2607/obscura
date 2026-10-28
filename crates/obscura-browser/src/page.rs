@@ -7326,6 +7326,32 @@ mod tests {
         assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
     }
 
+    /// A page script can call a frame's own Location methods (lazy-load
+    /// scripts do `iframe.contentWindow.location.replace(src)`). The running
+    /// context is then the page's, so the navigation was queued on the top
+    /// document, which loaded the iframe's URL in place of its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigating_a_frame_from_the_page_keeps_the_top_document() {
+        let mut page = import_map_test_page("frame-location-from-page", "https://parent.test",
+            "<title>Top document</title><body><iframe srcdoc='<form id=f action=/x></form>'></iframe></body>");
+        pump_srcdoc_frames(&mut page).await;
+        for call in [
+            "location.replace('https://embed.test/video')",
+            "location.assign('https://embed.test/video')",
+            "location.href = 'https://embed.test/video'",
+            "location.reload()",
+            "document.getElementById('f').submit()",
+        ] {
+            page.evaluate_script(&format!("document.querySelector('iframe').contentWindow.{call}; 1")).unwrap();
+            assert!(!page.has_pending_navigation(), "{call} queued a navigation on the top document");
+        }
+        assert_eq!(page.evaluate_script("[location.href, document.title]").unwrap(),
+            serde_json::json!(["https://parent.test/app/index.html", "Top document"]));
+        // The top document still navigates itself.
+        page.evaluate_script("location.href = 'https://other.test/'; 1").unwrap();
+        assert!(page.has_pending_navigation());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn iframe_srcdoc_replacement_cancels_stale_documents() {
         let mut page = import_map_test_page("srcdoc-replace", "https://parent.test", "<body></body>");
