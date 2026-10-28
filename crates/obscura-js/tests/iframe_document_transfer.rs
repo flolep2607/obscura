@@ -308,7 +308,7 @@ async fn repeated_adoption_preserves_owned_state_and_observers_after_id_reuse() 
         true,"dirty","shadow",[["attributes",true,"style"],["attributes",true,"data-moved"],["attributes",true,"data-again"]]
     ]));
     runtime.run_event_loop_bounded(100).await.unwrap();
-    assert_eq!(runtime.evaluate_script("adoptionState.notices.length").unwrap(), 3);
+    assert_eq!(runtime.evaluate_script("adoptionState.notices.length").unwrap().as_f64(), Some(3.0));
     runtime.evaluate_script(r#"(() => {
         globalThis.escapedNode = frame.contentDocument.createElement('p');
         escapedNode.textContent = 'escaped';
