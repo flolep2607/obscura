@@ -257,6 +257,9 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.font_family = Some("monospace".to_string());
         style.line_height = Some(crate::LineHeight::Normal);
         style.white_space = Some(crate::WhiteSpace::PreWrap);
+        style.overflow_specified_x = OVERFLOW_AUTO;
+        style.overflow_specified_y = OVERFLOW_AUTO;
+        recompute_overflow(&mut style);
         style.box_sizing = crate::BoxSizing::BorderBox;
         style.padding = Edges {
             top: 2.0,
@@ -640,8 +643,8 @@ struct ParsedOverflowAxis {
 const OVERFLOW_VISIBLE: u8 = 0;
 const OVERFLOW_CLIP: u8 = 1;
 const OVERFLOW_HIDDEN: u8 = 2;
-const OVERFLOW_SCROLL: u8 = 3;
-const OVERFLOW_AUTO: u8 = 4;
+pub(crate) const OVERFLOW_SCROLL: u8 = 3;
+pub(crate) const OVERFLOW_AUTO: u8 = 4;
 
 fn parse_overflow_axis(value: &str) -> Option<ParsedOverflowAxis> {
     let lower = value.trim().to_ascii_lowercase();

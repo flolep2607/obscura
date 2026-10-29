@@ -23,6 +23,7 @@
     .hidden-row { left: 500px; top: 100px; }
     .textarea-row { left: 0; top: 200px; }
     .textarea-rows8-row { left: 350px; top: 200px; }
+    .textarea-hidden-row { left: 700px; top: 200px; }
     .marker { width: 20px; }
     .form-marker { width: 100px; height: 20px; background: #087f5b; }
     .text-marker { height: 21px; background: #1971c2; }
@@ -32,6 +33,7 @@
     .hidden-marker { height: 20px; background: #2b8a3e; }
     .textarea-marker { height: 36px; background: #f08c00; }
     .textarea-rows8-marker { height: 126px; background: #e64980; }
+    .textarea-hidden-marker { height: 36px; background: #0c8599; }
   </style>
 </head>
 <body>
@@ -49,5 +51,6 @@
   <div class="row hidden-row"><input type="hidden"><div class="marker hidden-marker"></div></div>
   <div class="row textarea-row"><textarea></textarea><div class="marker textarea-marker"></div></div>
   <div class="row textarea-rows8-row"><textarea rows="8"></textarea><div class="marker textarea-rows8-marker"></div></div>
+  <div class="row textarea-hidden-row"><textarea style="overflow:hidden"></textarea><div class="marker textarea-hidden-marker"></div></div>
 </body>
 </html>

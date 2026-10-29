@@ -2444,6 +2444,23 @@ function _isDomNode(value) {
       && (typeof value._nid === "number" || value._documentShim === true));
 }
 
+// Common same-realm wrappers are identified by the private cache. Foreign
+// prototypes and numeric IDs are not ownership evidence: IDs belong to arenas.
+function _assertSameNativeTree(parent, node, method) {
+  if (_cache.get(parent._nid) === parent && _cache.get(node._nid) === node) return;
+  const parentFrame = __obscuraCore.ops.op_node_owner_frame(parent);
+  const nodeFrame = __obscuraCore.ops.op_node_owner_frame(node);
+  if (parentFrame < 0 || nodeFrame < 0 || parentFrame !== _realmFrameId || nodeFrame !== parentFrame) {
+    throw _mutationError(method, "Cross-document adoption is not supported.", "WrongDocumentError", parent);
+  }
+}
+function _assertInsertionNodes(context, nodes, method) {
+  _assertSameNativeTree(context, context, method);
+  for (const node of nodes) {
+    if (_isDomNode(node) && !_sameNativeTree(context, node)) _adoptionPlan(node);
+  }
+}
+
 function _requireNodeArgument(value, method, position, iface = "Node") {
   if (!_isDomNode(value)) {
     throw new TypeError(
@@ -2477,6 +2494,7 @@ function _mutationError(method, message, name, context) {
 
 function _isHostIncludingInclusiveAncestor(node, parent) {
   if (node === parent) return true;
+  if (!_sameNativeTree(node, parent)) return false;
   const type = node.nodeType;
   if (type !== 1 && type !== 9 && type !== 11) return false;
   // The native walk goes up from parent and through shadow hosts; leaves
@@ -2488,6 +2506,7 @@ function _isHostIncludingInclusiveAncestor(node, parent) {
 // (`replacing` true). Steps run in the spec's order because the order is
 // observable through which exception is thrown.
 function _ensureInsertionValidity(parent, node, child, method, replacing) {
+  _assertSameNativeTree(parent, parent, method);
   const parentType = parent.nodeType;
   if (parentType !== 1 && parentType !== 9 && parentType !== 11) {
     throw _mutationError(method, "This node type does not support this method.", "HierarchyRequestError", parent);
@@ -2571,6 +2590,7 @@ function _ensureDocumentChildValidity(parent, node, nodeType, child, method, rep
 // argument is collected into a DocumentFragment so the caller inserts once and
 // observers get a single record.
 function _convertNodesIntoNode(nodes, context) {
+  _assertInsertionNodes(context, nodes, "insert");
   if (nodes.length === 1 && _isDomNode(nodes[0])) return nodes[0];
   const owner = _nodeDocumentForInsertion(context);
   const converted = [];
@@ -2591,6 +2611,7 @@ function _convertNodesIntoNode(nodes, context) {
 // same, including the one childList record, without the fragment round trip.
 // Anything else takes the fragment path. `reference` is read after conversion.
 function _preInsertConverted(parent, args, context, reference, method) {
+  _assertInsertionNodes(parent, args, method);
   if (args.length === 1 && _isDomNode(args[0])) return _preInsertNode(parent, args[0], reference(), method);
   const parentType = parent.nodeType;
   if (args.length > 1 && (parentType === 1 || parentType === 11) && !(parent instanceof ShadowRoot)) {
@@ -2660,6 +2681,7 @@ function _hasMutationObservers() {
 
 // "Remove": `suppress` skips the record, as replace/replace-all queue their own.
 function _removeNode(parent, child, suppress, method = "removeChild") {
+  _assertSameNativeTree(parent, child, method);
   const observed = !suppress && _hasMutationObservers();
   const [previousSibling, nextSibling] = observed ? _recordSiblings(child) : [null, null];
   const removedWindowNames = _windowNamedNamesInTree(child);
@@ -2681,6 +2703,8 @@ function _removeNode(parent, child, suppress, method = "removeChild") {
 // that still has a parent is removed from it first, which old-parent
 // observers see as a removal (adopt runs "remove" before inserting).
 function _insertOneNode(parent, node, child, method, queueOldParentRecord) {
+  _adoptForInsertion(parent, node);
+  _assertSameNativeTree(parent, node, method);
   if (node._shadowParent) {
     node._shadowParent.removeChild(node);
   } else {
@@ -2732,6 +2756,7 @@ function _insertNode(parent, node, child, suppress, method) {
 
 function _preInsertNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, false);
+  _adoptForInsertion(parent, node);
   let reference = child;
   if (reference === node) reference = node.nextSibling;
   _insertNode(parent, node, reference, false, method);
@@ -2740,6 +2765,7 @@ function _preInsertNode(parent, node, child, method) {
 
 function _replaceChildNode(parent, node, child, method) {
   _ensureInsertionValidity(parent, node, child, method, true);
+  _adoptForInsertion(parent, node);
   let reference = child.nextSibling;
   if (reference === node) reference = node.nextSibling;
   let previousSibling = child.previousSibling;
@@ -2765,6 +2791,8 @@ function _replaceChildNode(parent, node, child, method) {
 
 // "Replace all" (replaceChildren, textContent). `node` may be null.
 function _replaceAllChildren(parent, node, method) {
+  if (node !== null) _adoptForInsertion(parent, node);
+  _assertSameNativeTree(parent, node === null ? parent : node, method);
   const removedNodes = Array.from(parent.childNodes);
   const observed = _hasMutationObservers();
   const addedNodes = node === null ? [] : (node.nodeType === 11 ? Array.from(node.childNodes) : [node]);
@@ -2925,7 +2953,7 @@ class Node {
   }
   contains(o) {
     if (o === this) return true;
-    return o ? _dom("contains", this._nid, o._nid) === "true" : false;
+    return o && _sameNativeTree(this, o) ? _dom("contains", this._nid, o._nid) === "true" : false;
   }
   hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
   cloneNode(deep) {
@@ -2998,7 +3026,8 @@ class Node {
       const order = own.compareDocumentPosition(target);
       return order & ~(ownAttr ? 16 : 0) & ~(otherAttr ? 8 : 0);
     }
-    if (this._nid === other._nid) return 0;
+    if (this === other) return 0;
+    if (!_sameNativeTree(this, other)) return 1 | 32 | (_nodeNativeFrame(this) < _nodeNativeFrame(other) ? 4 : 2);
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
     if (+_dom("node_root", this._nid) !== +_dom("node_root", other._nid)) {
@@ -3055,7 +3084,7 @@ class Node {
   }
   isEqualNode(other) {
     if (!other) return false;
-    if (this._nid === other._nid) return true;
+    if (this === other) return true;
     if (this.nodeType !== other.nodeType) return false;
     if (this.nodeName !== other.nodeName) return false;
     if (this.nodeValue !== other.nodeValue) return false;
@@ -3075,7 +3104,7 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return !!other && this._nid === other._nid; }
+  isSameNode(other) { return this === other; }
   addEventListener(type, callback, options) {
     _eventTargetAdd(this, type, callback, options);
   }
@@ -4860,7 +4889,7 @@ class Element extends Node {
       return '';
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (_formValues[this._nid] !== undefined) return _sanitizeEmailValue(this, _formValues[this._nid]);
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4879,7 +4908,7 @@ class Element extends Node {
         return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
       }
     }
-    return this.getAttribute("value") || "";
+    return _sanitizeEmailValue(this, this.getAttribute("value") || "");
   }
   // FileList for <input type=file>, populated by DOM.setFileInputFiles (Puppeteer
   // uploadFile / Playwright setInputFiles). null for non-file inputs, matching
@@ -4911,7 +4940,7 @@ class Element extends Node {
       }
       return;
     }
-    const value = String(v);
+    const value = _sanitizeEmailValue(this, String(v));
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
@@ -9144,18 +9173,25 @@ if (typeof Response === 'undefined') {
       this._bodyAborted = false;
       this._bodyAbortReason = undefined;
     }
-    _consumeBody() {
+    async _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      const stream = this._bodyStream;
       this._bodyUsed = true;
       if (this._bodyAborted) throw this._bodyAbortReason;
+      if (stream) {
+        const reader = stream.getReader();
+        while (!(await reader.read()).done) {}
+        reader.releaseLock();
+      }
+      return this._fetchBody ? await this._fetchBody.promise : this._bodyBytes;
     }
     get body() {
       if (this._bodyNull) return null;
-      if (this._bodyUsed) throw new TypeError("Body is already consumed");
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
             if (this._bodyAborted) { controller.error(this._bodyAbortReason); return; }
+            if (this._bodyUsed) { controller.close(); return; }
             const deliver = (bytes) => {
               if (bytes.length) controller.enqueue(bytes);
               controller.close();
@@ -9188,10 +9224,10 @@ if (typeof Response === 'undefined') {
       return this._bodyStream;
     }
     get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    async text() { return _decodeBodyWithCharset(await this._consumeBody(), this.headers); }
+    async json() { return JSON.parse(_decodeBodyWithCharset(await this._consumeBody(), this.headers)); }
+    async arrayBuffer() { return _arrayBufferFromBytes(await this._consumeBody()); }
+    async blob() { return new Blob([await this._consumeBody()]); }
     clone() {
       const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {
@@ -10784,6 +10820,7 @@ function _replaceAdoptedStyleSheets(root, sheets) {
 }
 
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
+  configurable: true,
   get() { return _adoptedStyleSheetsFor(this); },
   set(sheets) {
     _replaceAdoptedStyleSheets(this, sheets);
@@ -10907,10 +10944,11 @@ globalThis.MutationObserver = class MutationObserver {
     const existing = this._targets.find(registration => registration.target === target);
     if (existing) existing.options = init;
     else this._targets.push({ target, options: init });
-    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
+    _observeNodeOwner(this, target);
     if (!_mutationObserverRegistry.includes(this)) _mutationObserverRegistry.push(this);
   }
   disconnect() {
+    _disconnectNodeObservers(this);
     this._targets = [];
     this._records = [];
     const idx = globalThis.__mutationObservers.indexOf(this);
@@ -10955,8 +10993,8 @@ function _queueMutationRecord(type, target, init) {
       } else if (!options.childList) {
         continue;
       }
-      if (root !== target && root._nid !== target._nid) {
-        if (!options.subtree || !_isObservedAncestor(root, target)) continue;
+      if (root !== target) {
+        if (!_sameNativeTree(root, target) || !options.subtree || !_isObservedAncestor(root, target)) continue;
       }
       if (oldValue) wantsOldValue = true;
       matched = true;
@@ -16321,7 +16359,7 @@ function _shadowRootForHost(host, includeClosed) {
   if (!includeClosed && parts[1] !== 'open') return null;
   const rootNid = +parts[0];
   let root = _cache.get(rootNid);
-  if (!(root instanceof ShadowRoot)) {
+  if (!root || root._host !== host) {
     root = new ShadowRoot(rootNid, host, { mode: parts[1] });
     _cache.set(rootNid, root);
   }
@@ -18157,22 +18195,28 @@ if (typeof URLPattern === 'undefined') {
 if (typeof Document !== 'undefined' && !Document.prototype.importNode) {
   Document.prototype.importNode = function(node) {
     const deep = arguments[1];
+    const method = _documentRealmMember(this, 'importNode');
+    if (method) return Reflect.apply(method, this, [node, deep]);
     _requireNodeArgument(node, "importNode", 1, "Document");
     if (node.nodeType === 9 || node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'importNode' on 'Document': The node provided is a document, which may not be imported.", "NotSupportedError");
     }
-    const clone = node.cloneNode(!!deep);
+    const sourceFrame = __obscuraCore.ops.op_node_owner_frame(node);
+    if (sourceFrame === _realmFrameId) return _stampNodeDocument(node.cloneNode(!!deep), this);
+    const result = JSON.parse(__obscuraCore.ops.op_import_node(node, node._nid >>> 0, _realmFrameId, !!deep));
+    if (result.error) throw new DOMException("The node cannot be imported into this document.", result.error);
+    const clone = node.nodeType === 11 ? new DocumentFragment(result.nid) : _wrap(result.nid);
+    _cache.set(result.nid, clone);
+    _seedDetachedTreeState(clone);
     return _stampNodeDocument(clone, this);
   };
 }
 
-// Document.adoptNode: standard DOM (HTML living spec). Frameworks that move
-// nodes between documents (portals, iframe hand-off) call it; the missing
-// method throws "adoptNode is not a function". With no second document to
-// transfer ownership from, the node is already ours, so return it as-is,
-// matching the observable effect of adoption into this document.
+// Native adoption changes the owner while preserving the wrapper and listeners.
 if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
   Document.prototype.adoptNode = function(node) {
+    const method = _documentRealmMember(this, 'adoptNode');
+    if (method) return Reflect.apply(method, this, [node]);
     _requireNodeArgument(node, "adoptNode", 1, "Document");
     if (node.nodeType === 9) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a document, which may not be adopted.", "NotSupportedError");
@@ -18180,6 +18224,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.adoptNode) {
     if (node instanceof ShadowRoot) {
       throw new DOMException("Failed to execute 'adoptNode' on 'Document': The node provided is a shadow root, which may not be adopted.", "HierarchyRequestError");
     }
+    if (!_sameNativeTree(this, node)) return _adoptAcrossDocuments(this, node);
+    _assertSameNativeTree(this, node, "adoptNode");
     const parent = node.parentNode;
     if (parent) parent.removeChild(node);
     if (node._nodeDocument !== undefined) node._nodeDocument = undefined;
@@ -18412,10 +18458,12 @@ const _installCaretGeometry = (function _installCaretGeometry() {
   };
 });
 
+/* NODE_TRANSFER */
+
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'contentType', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint', 'queryCommandSupported', 'importNode', 'adoptNode'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),
@@ -18424,6 +18472,8 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   }],
   ['checkVisibility', Element.prototype.checkVisibility],
   ['elementStyle', function() { return _elementStyle(this); }],
+  ['nodeAdoptionSource', _nodeAdoptionSource],
+  ['registerNodeObserver', _registerNodeObserver],
 ]));
 
 globalThis.__obscura_init = (function() {
@@ -18869,12 +18919,44 @@ if (typeof ValidityState === 'undefined') {
 const _ns_validityCache = new WeakMap();
 const _ns_customValidityMsg = new WeakMap();
 
-// Element.prototype.validity - returns cached ValidityState for the element
+function _isEmailInput(element) {
+  return element.localName === 'input' && element._inputType() === 'email';
+}
+
+function _sanitizeEmailValue(element, value) {
+  if (!_isEmailInput(element)) return value;
+  const trim = token => token.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  return element.hasAttribute('multiple')
+    ? value.split(',').map(trim).join(',')
+    : trim(value.replace(/[\r\n]/g, ''));
+}
+
+// HTML's email grammar permits single-label domains and limits each label to 63 characters.
+const _emailAddressPattern = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+// Keep the cached object live when a caller retains input.validity across edits.
 if (!Element.prototype.validity) {
   Object.defineProperty(Element.prototype, 'validity', {
     get: function() {
       if (!_ns_validityCache.has(this)) {
-        _ns_validityCache.set(this, new ValidityState());
+        const element = this;
+        const validity = new ValidityState();
+        Object.defineProperties(validity, {
+          customError: { enumerable: true, get() { return _ns_customValidityMsg.has(element); } },
+          typeMismatch: { enumerable: true, get() {
+            if (!_isEmailInput(element) || element.value === '') return false;
+            const values = element.hasAttribute('multiple') ? element.value.split(',') : [element.value];
+            return values.some(value => !_emailAddressPattern.test(value));
+          } },
+          valueMissing: { enumerable: true, get() {
+            return _isEmailInput(element) && !element.readOnly && !_isActuallyDisabled(element)
+              && element.hasAttribute('required') && element.value === '';
+          } },
+          valid: { enumerable: true, get() {
+            return !this.customError && !this.typeMismatch && !this.valueMissing;
+          } },
+        });
+        _ns_validityCache.set(this, validity);
       }
       return _ns_validityCache.get(this);
     },
@@ -18887,36 +18969,50 @@ if (!Element.prototype.validity) {
 if (!Element.prototype.willValidate) {
   Object.defineProperty(Element.prototype, 'willValidate', {
     get: function() {
-      return true;
+      if (_isActuallyDisabled(this) || this.closest('datalist')) return false;
+      if (this.localName === 'input') {
+        const type = this._inputType();
+        if (['hidden', 'reset', 'button'].includes(type)) return false;
+        if (this.readOnly && ['text', 'search', 'url', 'tel', 'email', 'password',
+          'date', 'month', 'week', 'time', 'datetime-local', 'number'].includes(type)) return false;
+      }
+      if (this.localName === 'textarea' && this.readOnly) return false;
+      return !['fieldset', 'output'].includes(this.localName);
     },
     enumerable: true,
     configurable: true
   });
 }
 
-// Element.prototype.validationMessage - custom validation message if set
+// Element.prototype.validationMessage - active constraint or custom validation message
 if (!Element.prototype.validationMessage) {
   Object.defineProperty(Element.prototype, 'validationMessage', {
     get: function() {
-      return _ns_customValidityMsg.get(this) || '';
+      if (!this.willValidate) return '';
+      if (_ns_customValidityMsg.has(this)) return _ns_customValidityMsg.get(this);
+      if (this.validity.valueMissing) return 'Please fill out this field.';
+      if (this.validity.typeMismatch) return 'Please enter an email address.';
+      return '';
     },
     enumerable: true,
     configurable: true
   });
 }
 
-// Element.prototype.checkValidity - stub returns true
+// Check current constraints and dispatch the cancelable, non-bubbling invalid event.
 if (!Element.prototype.checkValidity) {
   Element.prototype.checkValidity = function checkValidity() {
-    return true;
+    if (!this.willValidate || this.validity.valid) return true;
+    this.dispatchEvent(new Event('invalid', { cancelable: true }));
+    return false;
   };
   _markNative(Element.prototype.checkValidity);
 }
 
-// Element.prototype.reportValidity - stub returns true
+// Headless validation reports the same result and event as checkValidity.
 if (!Element.prototype.reportValidity) {
   Element.prototype.reportValidity = function reportValidity() {
-    return true;
+    return this.checkValidity();
   };
   _markNative(Element.prototype.reportValidity);
 }
@@ -18924,16 +19020,9 @@ if (!Element.prototype.reportValidity) {
 // Element.prototype.setCustomValidity - set custom validation message
 if (!Element.prototype.setCustomValidity) {
   Element.prototype.setCustomValidity = function setCustomValidity(msg) {
-    const validity = this.validity;
-    if (msg && msg.length > 0) {
-      _ns_customValidityMsg.set(this, msg);
-      validity.customError = true;
-      validity.valid = false;
-    } else {
-      _ns_customValidityMsg.delete(this);
-      validity.customError = false;
-      validity.valid = true;
-    }
+    const message = String(msg);
+    if (message) _ns_customValidityMsg.set(this, message);
+    else _ns_customValidityMsg.delete(this);
   };
   _markNative(Element.prototype.setCustomValidity);
 }
@@ -19151,6 +19240,8 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
     }
   }
 })();
+
+_installAdoptedNodeDispatch();
 
 (function _markBuiltinsNative() {
   var seen = new Set();

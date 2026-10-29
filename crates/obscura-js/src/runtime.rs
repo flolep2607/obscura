@@ -4619,7 +4619,8 @@ mod tests {
     #[test]
     fn bootstrap_source_uses_ascii_snapshot_storage() {
         let source = include_str!("../js/bootstrap.js")
-            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"));
+            .replace("/* INDEXED_DB */", include_str!("../js/indexed_db.js"))
+            .replace("/* NODE_TRANSFER */", include_str!("../js/node_transfer.js"));
         assert!(source.is_ascii(), "use Unicode escapes in bootstrap literals so source can be shared");
         if cfg!(obscura_external_bootstrap) {
             assert_eq!(super::SNAPSHOT.windows(source.len())
@@ -7295,7 +7296,7 @@ mod tests {
     #[test]
     fn first_element_style_access_ignores_replaced_page_intrinsics() {
         let mut rt = setup_runtime("<html><body>Style</body></html>");
-        assert_eq!(rt.evaluate(r#"(() => {
+        assert_eq!(rt.evaluate_script(r#"(() => {
             const element = document.body;
             const original = [globalThis.Proxy, Object.defineProperty,
                 WeakMap.prototype.get, WeakMap.prototype.set, Reflect.apply];
@@ -9901,6 +9902,84 @@ mod tests {
             [true, false, false, true, true, false, true],
             ["Visible label", "Input label"], "edited", true
         ]));
+    }
+
+    #[test]
+    fn email_constraint_validation_tracks_edits_and_dispatches_invalid() {
+        let mut rt = setup_runtime(r#"<html><body><form><input id="email" type="email"></form>
+            <fieldset disabled><legend><input id="legend" type="email" value="bad"></legend>
+                <input id="disabled" type="email" value="bad"></fieldset>
+            <datalist><input id="listed" type="email" value="bad"></datalist></body></html>"#);
+        let result = rt.evaluate(r#"
+            const input = document.getElementById('email');
+            const validity = input.validity;
+            const invalid = [];
+            let bubbled = 0;
+            input.parentElement.addEventListener('invalid', () => bubbled++);
+            input.addEventListener('invalid', event => {
+                invalid.push([event.target === input, event.bubbles, event.cancelable]);
+                event.preventDefault();
+            });
+            const cases = ['', 'bad', 'a@b', ' a@b\r\n ', 'a@-b', 'a@b-', 'a@b..c',
+                'a b@c', 'a@@b', 'a@' + 'b'.repeat(64), 'a@b,c@d', '\u00a0a@b',
+                'a@' + 'b'.repeat(63), 'a@\nb'].map(value => {
+                input.value = value;
+                return [input.value, validity.typeMismatch, input.checkValidity()];
+            });
+            input.setAttribute('multiple', '');
+            const multiple = ['', ' a@b, c@d ', 'a@b,', ',a@b', 'a@b,bad'].map(value => {
+                input.value = value;
+                return [input.value, validity.typeMismatch, input.checkValidity()];
+            });
+            input.removeAttribute('multiple');
+            input.setAttribute('required', '');
+            input.value = '';
+            const required = [validity.valueMissing, input.checkValidity(), input.validationMessage !== ''];
+            input.value = 'a@b';
+            input.setCustomValidity('blocked');
+            const custom = [validity.customError, validity.valid, input.reportValidity(), input.validationMessage];
+            input.value = 'bad';
+            input.setCustomValidity('');
+            const cleared = [validity.customError, validity.typeMismatch, validity.valid, input.checkValidity()];
+            input.setAttribute('disabled', '');
+            const disabled = [input.willValidate, input.checkValidity(), input.validationMessage];
+            input.removeAttribute('disabled');
+            input.readOnly = true;
+            const readonly = [input.willValidate, input.reportValidity(), input.validationMessage];
+            input.readOnly = false;
+            input.value = 'a@b';
+            const corrected = [validity === input.validity, validity.valid, input.checkValidity(), input.validationMessage];
+            const barred = ['legend', 'disabled', 'listed'].map(id => {
+                const field = document.getElementById(id);
+                return [field.willValidate, field.checkValidity()];
+            });
+            const barredCustom = ['disabled', 'readonly', 'hidden'].map(state => {
+                const field = document.createElement('input');
+                field.type = state === 'hidden' ? 'hidden' : 'text';
+                if (state !== 'hidden') field.setAttribute(state, '');
+                field.setCustomValidity('blocked');
+                let events = 0;
+                field.addEventListener('invalid', () => events++);
+                return [field.willValidate, field.checkValidity(), field.reportValidity(), events];
+            });
+            return { cases, multiple, required, custom, cleared, disabled, readonly, corrected, barred, barredCustom,
+                events: [invalid.length, invalid.every(event => JSON.stringify(event) === '[true,false,true]'), bubbled] };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "cases": [["", false, true], ["bad", true, false], ["a@b", false, true], ["a@b", false, true],
+                ["a@-b", true, false], ["a@b-", true, false], ["a@b..c", true, false], ["a b@c", true, false],
+                ["a@@b", true, false], [format!("a@{}", "b".repeat(64)), true, false],
+                ["a@b,c@d", true, false], ["\u{a0}a@b", true, false],
+                [format!("a@{}", "b".repeat(63)), false, true], ["a@b", false, true]],
+            "multiple": [["", false, true], ["a@b,c@d", false, true], ["a@b,", true, false],
+                [",a@b", true, false], ["a@b,bad", true, false]],
+            "required": [true, false, true], "custom": [true, false, false, "blocked"],
+            "cleared": [false, true, false, false], "disabled": [false, true, ""],
+            "readonly": [false, true, ""], "corrected": [true, true, true, ""],
+            "barred": [[true, false], [false, true], [false, true]],
+            "barredCustom": [[false, true, true, 0], [false, true, true, 0], [false, true, true, 0]],
+            "events": [15, true, 0]
+        }));
     }
 
     #[test]
@@ -19603,14 +19682,42 @@ mod tests {
                         bodyUsed: r.bodyUsed,
                         hasReader: !!(r.body && r.body.getReader),
                     };
-                    const reader = r.body.getReader();
+                    const stream = r.body;
+                    const reader = stream.getReader();
+                    const lockedBody = [r.body === stream, r.body.locked, r.bodyUsed];
                     const first = await reader.read();
                     const second = await reader.read();
                     const chunkText = first.value ? new TextDecoder().decode(first.value) : "";
                     const consumed = r.bodyUsed;
-                    let doubleThrew = false;
-                    try { await r.text(); } catch (e) { doubleThrew = true; }
-                    return { meta, chunkText, done: second.done, consumed, doubleThrew, nullBody: new Response(null).body === null };
+                    const sameBodyAfterRead = r.body === stream;
+                    reader.releaseLock();
+                    const doubleThrew = await r.text().then(() => false, error => error instanceof TypeError);
+                    const methodBodies = [];
+                    const methodValues = [];
+                    for (const method of ["text", "json", "arrayBuffer", "blob"]) {
+                        for (const exposeFirst of [false, true]) {
+                            const response = new Response('{}');
+                            const before = exposeFirst ? response.body : null;
+                            const value = await response[method]();
+                            methodValues.push(method === "arrayBuffer" ? new TextDecoder().decode(value)
+                                : method === "blob" ? await value.text()
+                                : method === "json" ? JSON.stringify(value) : value);
+                            const body = response.body;
+                            const exhausted = await body.getReader().read();
+                            const doubleRead = await response[method]().then(() => false, error => error instanceof TypeError);
+                            methodBodies.push([
+                                before === null || before === body,
+                                response.body === body,
+                                response.bodyUsed,
+                                exhausted.done,
+                                exhausted.value === undefined,
+                                doubleRead,
+                            ]);
+                        }
+                    }
+                    return { meta, chunkText, done: second.done, consumed, doubleThrew,
+                        lockedBody, sameBodyAfterRead, methodBodies, methodValues,
+                        nullBody: new Response(null).body === null };
                 })()"#,
                 true,
                 true,
@@ -19625,6 +19732,10 @@ mod tests {
         assert_eq!(out["done"], true);
         assert_eq!(out["consumed"], true);
         assert_eq!(out["doubleThrew"], true);
+        assert_eq!(out["lockedBody"], serde_json::json!([true, true, true]));
+        assert_eq!(out["sameBodyAfterRead"], true);
+        assert_eq!(out["methodBodies"], serde_json::json!(vec![vec![true; 6]; 8]));
+        assert_eq!(out["methodValues"], serde_json::json!(vec!["{}"; 8]));
         assert_eq!(out["nullBody"], true);
     }
 

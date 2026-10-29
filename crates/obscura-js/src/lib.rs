@@ -3,6 +3,7 @@ pub mod frame;
 mod import_map;
 pub mod indexed_db;
 pub mod markdown;
+mod node_transfer;
 pub mod module_loader;
 pub mod ops;
 pub mod runtime;

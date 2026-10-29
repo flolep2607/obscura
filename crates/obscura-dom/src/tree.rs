@@ -66,6 +66,27 @@ impl fmt::Display for AttachShadowError {
 
 impl std::error::Error for AttachShadowError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptNodeError {
+    SameTree,
+    InvalidRoot,
+    InvalidSubtree,
+    Allocation,
+}
+
+impl fmt::Display for AdoptNodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SameTree => "node adoption requires distinct trees",
+            Self::InvalidRoot => "node cannot be adopted as an independent root",
+            Self::InvalidSubtree => "node ownership graph is invalid",
+            Self::Allocation => "node adoption allocation failed",
+        })
+    }
+}
+
+impl std::error::Error for AdoptNodeError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
     pub name: QualName,
@@ -1788,74 +1809,323 @@ impl DomTree {
     }
 
     /// Copies a node together with its subtree from `source` and attaches it to `parent_id`.
-    /// Returns the copy of `source_node_id` itself, so that a caller that keeps parsing into
-    /// `source` can map the source to its copy.
     pub fn import_node_from(
         &self,
         parent_id: NodeId,
         source: &DomTree,
         source_node_id: NodeId,
     ) -> Option<NodeId> {
-        // Iterative DFS with an explicit (dest_parent, source_node) stack so a
-        // deeply nested source tree cannot overflow the thread stack and abort
-        // the process. Children are pushed in reverse so they are appended in
-        // document order (append_child always appends to the end, so each level
-        // keeps the source ordering).
-        let mut imported_root = None;
-        let mut stack = vec![(parent_id, source_node_id)];
-        while let Some((dest_parent, src_id)) = stack.pop() {
-            let node_data = {
-                let source_inner = source.inner.borrow();
-                match source_inner.nodes.get(src_id.index()) {
-                    Some(Some(node)) => node.data.clone(),
-                    _ => continue,
-                }
-            };
+        let (root, _) = self.import_detached_node_from(source, source_node_id, true)?;
+        self.append_child(parent_id, root);
+        Some(root)
+    }
 
+    /// Copy into this arena without attaching the root. The mapping includes
+    /// template-content documents, so the caller can remap per-node state.
+    pub fn import_detached_node_from(
+        &self,
+        source: &DomTree,
+        source_node_id: NodeId,
+        deep: bool,
+    ) -> Option<(NodeId, Vec<(NodeId, NodeId)>)> {
+        if source.is_shadow_root(source_node_id) || source.get_node(source_node_id).is_none() {
+            return None;
+        }
+        let mut imported_root = None;
+        let mut mapping = Vec::new();
+        // Iterative traversal also keeps deeply nested template contents off
+        // the Rust call stack. A shallow template gets an empty contents node.
+        let mut stack = vec![(None, source_node_id)];
+        while let Some((dest_parent, src_id)) = stack.pop() {
+            let node_data = source.get_node(src_id)?.data;
             let new_id = self.new_node(node_data);
-            self.append_child(dest_parent, new_id);
-            // The first node off the stack is source_node_id itself.
+            if let Some(parent) = dest_parent {
+                self.append_child(parent, new_id);
+            }
             if imported_root.is_none() {
                 imported_root = Some(new_id);
             }
-
-            // A <template>'s children hang off a separate contents document, so
-            // the child walk below never reaches them. Worse, the cloned data
-            // carries the *source* tree's contents NodeId, which here indexes
-            // whatever unrelated node occupies that slot. Allocate a real
-            // contents node and queue the source contents' children into it, so
-            // the reference is remapped rather than left dangling (issue #463).
-            let src_contents = {
-                let inner = self.inner.borrow();
-                match inner.nodes.get(new_id.index()).and_then(|n| n.as_ref()) {
-                    Some(node) => match &node.data {
-                        NodeData::Element { template_contents, .. } => *template_contents,
-                        _ => None,
-                    },
-                    None => None,
-                }
-            };
+            mapping.push((src_id, new_id));
+            if let Some(mut state) = source.form_control_state(src_id) {
+                state.indeterminate = false;
+                self.update_form_control_state(new_id, |control| *control = state);
+            }
+            let src_contents = source.with_node(src_id, |node| match &node.data {
+                NodeData::Element { template_contents, .. } => *template_contents,
+                _ => None,
+            }).flatten();
             if let Some(src_contents) = src_contents {
                 let dest_contents = self.new_node(NodeData::Document);
-                {
-                    let mut inner = self.inner.borrow_mut();
-                    if let Some(Some(node)) = inner.nodes.get_mut(new_id.index()) {
-                        if let NodeData::Element { template_contents, .. } = &mut node.data {
-                            *template_contents = Some(dest_contents);
-                        }
+                self.with_node_mut(new_id, |node| {
+                    if let NodeData::Element { template_contents, .. } = &mut node.data {
+                        *template_contents = Some(dest_contents);
+                    }
+                });
+                mapping.push((src_contents, dest_contents));
+                if deep {
+                    for child in source.children(src_contents).into_iter().rev() {
+                        stack.push((Some(dest_contents), child));
                     }
                 }
-                // Onto the same stack, so nested templates stay iterative.
-                for child_id in source.children(src_contents).into_iter().rev() {
-                    stack.push((dest_contents, child_id));
+            }
+            if deep {
+                for child in source.children(src_id).into_iter().rev() {
+                    stack.push((Some(new_id), child));
                 }
             }
+        }
+        Some((imported_root?, mapping))
+    }
 
-            for child_id in source.children(src_id).into_iter().rev() {
-                stack.push((new_id, child_id));
+    /// Validate and collect every node owned by an adoption root, including
+    /// template contents and closed shadow trees. Ordinary DOM walks remain
+    /// tree-scoped; this traversal is only for transferring native ownership.
+    pub fn adoption_node_ids(&self, root: NodeId) -> Result<Vec<NodeId>, AdoptNodeError> {
+        Self::adoption_node_ids_inner(&self.inner.borrow(), root)
+    }
+
+    fn adoption_node_ids_inner(
+        inner: &DomTreeInner,
+        root: NodeId,
+    ) -> Result<Vec<NodeId>, AdoptNodeError> {
+        let get = |id: NodeId| inner.nodes.get(id.index()).and_then(Option::as_ref)
+            .filter(|node| node.id == id).ok_or(AdoptNodeError::InvalidSubtree);
+        let root_node = get(root)?;
+        if root == inner.document || inner.shadow_roots.contains_key(&root) {
+            return Err(AdoptNodeError::InvalidRoot);
+        }
+        match root_node.parent {
+            Some(parent) => {
+                let parent_id = parent;
+                let parent = get(parent)?;
+                for sibling in [root_node.prev_sibling, root_node.next_sibling].into_iter().flatten() {
+                    if get(sibling)?.parent != Some(parent_id) {
+                        return Err(AdoptNodeError::InvalidSubtree);
+                    }
+                }
+                if root_node.prev_sibling.map(|id| get(id).map(|node| node.next_sibling))
+                    .transpose()?.unwrap_or(parent.first_child) != Some(root)
+                    || root_node.next_sibling.map(|id| get(id).map(|node| node.prev_sibling))
+                        .transpose()?.unwrap_or(parent.last_child) != Some(root)
+                {
+                    return Err(AdoptNodeError::InvalidSubtree);
+                }
+            },
+            None if root_node.prev_sibling.is_some() || root_node.next_sibling.is_some() => {
+                return Err(AdoptNodeError::InvalidSubtree);
+            },
+            None => {},
+        }
+
+        let mut nodes = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            seen.try_reserve(1).map_err(|_| AdoptNodeError::Allocation)?;
+            if !seen.insert(id) { return Err(AdoptNodeError::InvalidSubtree); }
+            let node = get(id)?;
+            nodes.try_reserve(1).map_err(|_| AdoptNodeError::Allocation)?;
+            nodes.push(id);
+
+            if let Some(shadow) = inner.shadow_roots_by_host.get(&id) {
+                let info = inner.shadow_roots.get(shadow).ok_or(AdoptNodeError::InvalidSubtree)?;
+                let shadow_node = get(*shadow)?;
+                if !node.is_element() || info.id != *shadow || info.host != id
+                    || *shadow == inner.document || !shadow_node.is_document()
+                    || shadow_node.parent.is_some() || shadow_node.prev_sibling.is_some()
+                    || shadow_node.next_sibling.is_some()
+                {
+                    return Err(AdoptNodeError::InvalidSubtree);
+                }
+                stack.try_reserve(1).map_err(|_| AdoptNodeError::Allocation)?;
+                stack.push(*shadow);
+            }
+            if let Some(info) = inner.shadow_roots.get(&id) {
+                if !seen.contains(&info.host)
+                    || inner.shadow_roots_by_host.get(&info.host) != Some(&id)
+                {
+                    return Err(AdoptNodeError::InvalidSubtree);
+                }
+            }
+            if let NodeData::Element { template_contents: Some(contents), .. } = &node.data {
+                let contents_node = get(*contents)?;
+                if *contents == inner.document || !contents_node.is_document()
+                    || contents_node.parent.is_some() || contents_node.prev_sibling.is_some()
+                    || contents_node.next_sibling.is_some() || inner.shadow_roots.contains_key(contents)
+                {
+                    return Err(AdoptNodeError::InvalidSubtree);
+                }
+                stack.try_reserve(1).map_err(|_| AdoptNodeError::Allocation)?;
+                stack.push(*contents);
+            }
+
+            // Push from last to first to keep ordinary children in document
+            // order without a recursive walk or another child snapshot.
+            let mut child = node.last_child;
+            let mut next = None;
+            let mut remaining = inner.nodes.len();
+            while let Some(child_id) = child {
+                if remaining == 0 { return Err(AdoptNodeError::InvalidSubtree); }
+                remaining -= 1;
+                let child_node = get(child_id)?;
+                if child_node.parent != Some(id) || child_node.next_sibling != next {
+                    return Err(AdoptNodeError::InvalidSubtree);
+                }
+                stack.try_reserve(1).map_err(|_| AdoptNodeError::Allocation)?;
+                stack.push(child_id);
+                next = Some(child_id);
+                child = child_node.prev_sibling;
+            }
+            if next != node.first_child { return Err(AdoptNodeError::InvalidSubtree); }
+        }
+        if root_node.parent.is_some_and(|parent| seen.contains(&parent)) {
+            return Err(AdoptNodeError::InvalidSubtree);
+        }
+        // A template-content root cannot move independently while its owner
+        // keeps an arena-local reference. Reject shared or external ownership.
+        for owner in inner.nodes.iter().flatten() {
+            if let NodeData::Element { template_contents: Some(contents), .. } = &owner.data {
+                if seen.contains(contents) && !seen.contains(&owner.id) {
+                    return Err(if *contents == root { AdoptNodeError::InvalidRoot }
+                        else { AdoptNodeError::InvalidSubtree });
+                }
             }
         }
-        imported_root
+        Ok(nodes)
+    }
+
+    fn validate_adoption_free_slots(inner: &DomTreeInner) -> Result<(), AdoptNodeError> {
+        let mut seen = HashSet::new();
+        seen.try_reserve(inner.free_list.len()).map_err(|_| AdoptNodeError::Allocation)?;
+        for slot in &inner.free_list {
+            if !inner.nodes.get(*slot as usize).is_some_and(Option::is_none) || !seen.insert(*slot) {
+                return Err(AdoptNodeError::InvalidSubtree);
+            }
+        }
+        Ok(())
+    }
+
+    /// Move a complete owned subtree into this arena and return its detached
+    /// root and old-to-new IDs. All validation and fallible reservations finish
+    /// before commit. No callback or allocation may reuse source IDs until the
+    /// caller has remapped its wrappers and document-owned state.
+    pub fn adopt_node_from(
+        &self,
+        source: &DomTree,
+        root: NodeId,
+    ) -> Result<(NodeId, Vec<(NodeId, NodeId)>), AdoptNodeError> {
+        if std::ptr::eq(self, source) { return Err(AdoptNodeError::SameTree); }
+        let source_inner = source.inner.borrow();
+        let source_ids = Self::adoption_node_ids_inner(&source_inner, root)?;
+        Self::validate_adoption_free_slots(&source_inner)?;
+        let mut target = self.inner.borrow_mut();
+        Self::validate_adoption_free_slots(&target)?;
+        let reused = source_ids.len().min(target.free_list.len());
+        let extra = source_ids.len() - reused;
+        let total = target.nodes.len().checked_add(extra)
+            .filter(|total| total.checked_sub(1).is_some_and(|last| u32::try_from(last).is_ok()))
+            .ok_or(AdoptNodeError::Allocation)?;
+
+        let mut mapping = Vec::new();
+        mapping.try_reserve_exact(source_ids.len()).map_err(|_| AdoptNodeError::Allocation)?;
+        let mut mapped = HashMap::new();
+        mapped.try_reserve(source_ids.len()).map_err(|_| AdoptNodeError::Allocation)?;
+        for (index, old) in source_ids.iter().copied().enumerate() {
+            let new = if index < reused {
+                NodeId(target.free_list[target.free_list.len() - index - 1])
+            } else {
+                NodeId((target.nodes.len() + index - reused) as u32)
+            };
+            mapping.push((old, new));
+            mapped.insert(old, new);
+        }
+        let remap = |id: NodeId| mapped.get(&id).copied().ok_or(AdoptNodeError::InvalidSubtree);
+        let mut prepared = Vec::new();
+        prepared.try_reserve_exact(source_ids.len()).map_err(|_| AdoptNodeError::Allocation)?;
+        for (old, new) in &mapping {
+            let mut node = source_inner.nodes[old.index()].as_ref()
+                .ok_or(AdoptNodeError::InvalidSubtree)?.clone();
+            node.id = *new;
+            node.connected = false;
+            node.parent = if *old == root { None } else { node.parent.map(&remap).transpose()? };
+            node.prev_sibling = if *old == root { None } else { node.prev_sibling.map(&remap).transpose()? };
+            node.next_sibling = if *old == root { None } else { node.next_sibling.map(&remap).transpose()? };
+            node.first_child = node.first_child.map(&remap).transpose()?;
+            node.last_child = node.last_child.map(&remap).transpose()?;
+            if let NodeData::Element { template_contents, .. } = &mut node.data {
+                *template_contents = template_contents.map(&remap).transpose()?;
+            }
+            let shadow = source_inner.shadow_roots.get(old).map(|info| {
+                Ok::<_, AdoptNodeError>(ShadowRoot { id: *new, host: remap(info.host)?, mode: info.mode })
+            }).transpose()?;
+            let id_attribute = node.get_attribute("id").map(str::to_owned);
+            prepared.push((node, source_inner.form_controls.get(old).cloned(),
+                source_inner.external_stylesheets.get(old).cloned(), shadow, id_attribute));
+        }
+        let source_root = source_inner.nodes[root.index()].as_ref()
+            .ok_or(AdoptNodeError::InvalidSubtree)?.clone();
+        drop(source_inner);
+        let mut source_inner = source.inner.borrow_mut();
+        source_inner.free_list.try_reserve(source_ids.len()).map_err(|_| AdoptNodeError::Allocation)?;
+        target.nodes.try_reserve(extra).map_err(|_| AdoptNodeError::Allocation)?;
+        target.form_controls.try_reserve(prepared.iter().filter(|entry| entry.1.is_some()).count())
+            .map_err(|_| AdoptNodeError::Allocation)?;
+        target.external_stylesheets.try_reserve(prepared.iter().filter(|entry| entry.2.is_some()).count())
+            .map_err(|_| AdoptNodeError::Allocation)?;
+        let shadow_count = prepared.iter().filter(|entry| entry.3.is_some()).count();
+        target.shadow_roots.try_reserve(shadow_count).map_err(|_| AdoptNodeError::Allocation)?;
+        target.shadow_roots_by_host.try_reserve(shadow_count).map_err(|_| AdoptNodeError::Allocation)?;
+        target.id_index.try_reserve(prepared.iter().filter(|entry| entry.4.is_some()).count())
+            .map_err(|_| AdoptNodeError::Allocation)?;
+
+        // Commit has no fallible step. Populate the complete destination before
+        // retiring source storage, so failed preflight leaves the source intact.
+        target.nodes.resize_with(total, || None);
+        let free_count = target.free_list.len() - reused;
+        target.free_list.truncate(free_count);
+        let mut moved_sheets = false;
+        for (node, control, sheet, shadow, id_attribute) in prepared {
+            let id = node.id;
+            target.nodes[id.index()] = Some(node);
+            if let Some(control) = control { target.form_controls.insert(id, control); }
+            if let Some(sheet) = sheet {
+                target.external_stylesheets.insert(id, sheet);
+                moved_sheets = true;
+            }
+            if let Some(shadow) = shadow {
+                target.shadow_roots.insert(id, shadow);
+                target.shadow_roots_by_host.insert(shadow.host, id);
+            }
+            if let Some(attribute) = id_attribute { target.id_index.entry(attribute).or_insert(id); }
+        }
+        if moved_sheets {
+            target.external_stylesheet_generation = target.external_stylesheet_generation.wrapping_add(1);
+            source_inner.external_stylesheet_generation = source_inner.external_stylesheet_generation.wrapping_add(1);
+        }
+        if let Some(parent) = source_root.parent {
+            Self::invalidate_cssom_source(&mut source_inner, parent);
+            if let Some(previous) = source_root.prev_sibling {
+                source_inner.nodes[previous.index()].as_mut().unwrap().next_sibling = source_root.next_sibling;
+            } else {
+                source_inner.nodes[parent.index()].as_mut().unwrap().first_child = source_root.next_sibling;
+            }
+            if let Some(next) = source_root.next_sibling {
+                source_inner.nodes[next.index()].as_mut().unwrap().prev_sibling = source_root.prev_sibling;
+            } else {
+                source_inner.nodes[parent.index()].as_mut().unwrap().last_child = source_root.prev_sibling;
+            }
+        }
+        source_inner.id_index.retain(|_, id| !mapped.contains_key(id));
+        source_inner.shadow_roots.retain(|id, _| !mapped.contains_key(id));
+        source_inner.shadow_roots_by_host.retain(|host, _| !mapped.contains_key(host));
+        if source_inner.hovered.is_some_and(|id| mapped.contains_key(&id)) { source_inner.hovered = None; }
+        for old in source_ids {
+            source_inner.form_controls.remove(&old);
+            source_inner.external_stylesheets.remove(&old);
+            source_inner.nodes[old.index()] = None;
+            source_inner.free_list.push(old.0);
+        }
+        Ok((mapped[&root], mapping))
     }
 
     pub fn len(&self) -> usize {
