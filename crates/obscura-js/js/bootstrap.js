@@ -8049,6 +8049,13 @@ Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
 });
+// Chrome's global stringifies as [object Window]. Without the tag, toString
+// probes see a plain Object and treat the page as non-browser.
+try {
+  Object.defineProperty(Object.getPrototypeOf(globalThis), Symbol.toStringTag, {
+    value: 'Window', configurable: true,
+  });
+} catch (e) {}
 // A browser global is a Window object, not merely an object accepted by
 // `Window[Symbol.hasInstance]`. Framework environment gates (including Ember's)
 // also require the direct identity `self.constructor === Window`; leaving the
@@ -8208,6 +8215,13 @@ function _chromeMajor() {
   var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
   return m ? (m[1] | 0) : 145;
 }
+// The UA string is frozen to major.0.0.0, but high-entropy uaFullVersion
+// carries the real minor/build/patch. "major.0.0.0" there is a giveaway.
+function _chromeFullVersion() {
+  var build = 7000 + Math.floor(_fpRand(900) * 800);
+  var patch = Math.floor(_fpRand(901) * 200);
+  return _chromeMajor() + '.0.' + build + '.' + patch;
+}
 // Chromium derives the sec-ch-ua GREASE brand, version, and brand order
 // deterministically from the Chrome major version
 // (components/embedder_support/user_agent_utils.cc). Replicating it keeps
@@ -8231,9 +8245,10 @@ function _uaBrands() {
   return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
 }
 
-// Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
-// hop below, not as own props here: own accessors are a bot tell.
-globalThis.navigator = {
+// Chrome keeps every Navigator member on Navigator.prototype and the instance
+// has no own properties. Build the values here, then install them on the
+// prototype below so getOwnPropertyNames(navigator) stays empty.
+var _navImpl = {
   onLine: true, cookieEnabled: true,
   maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
@@ -8246,16 +8261,19 @@ globalThis.navigator = {
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
       var brands = _uaBrands();
+      var full = _chromeFullVersion();
       return Promise.resolve({
         architecture: "x86",
         bitness: "64",
         brands: brands,
-        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
+        fullVersionList: brands.map(function(b) {
+          return {brand: b.brand, version: b.brand.indexOf('Not') === 0 ? b.version : full};
+        }),
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: _chromeMajor() + ".0.0.0",
+        uaFullVersion: full,
         wow64: false,
       });
     },
@@ -8326,17 +8344,38 @@ globalThis.navigator = {
   },
 };
 
-// Put spoofed navigator props on a thin prototype above Navigator.prototype
-// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
-// Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
+// Install Navigator members on Navigator.prototype (never on the instance) and
+// hang the prototype off EventTarget, matching Chrome's chain:
+// navigator -> Navigator.prototype -> EventTarget.prototype -> Object.prototype.
+globalThis.navigator = Object.create(Navigator.prototype);
+
 (function() {
-  var _navProto = Object.create(Navigator.prototype);
+  try {
+    if (typeof EventTarget === 'function' &&
+        Object.getPrototypeOf(Navigator.prototype) === Object.prototype) {
+      Object.setPrototypeOf(Navigator.prototype, EventTarget.prototype);
+    }
+  } catch (e) {}
 
   function defGetter(key, fn) {
     _markNative(fn);
-    Object.defineProperty(_navProto, key, {
+    Object.defineProperty(Navigator.prototype, key, {
       get: fn, set: undefined, enumerable: true, configurable: true,
     });
+  }
+
+  function defMember(key, value) {
+    if (typeof value === 'function') {
+      Object.defineProperty(Navigator.prototype, key, {
+        value: _markNative(value), writable: true, enumerable: true, configurable: true,
+      });
+    } else {
+      defGetter(key, function() { return value; });
+    }
+  }
+
+  for (var k in _navImpl) {
+    if (Object.prototype.hasOwnProperty.call(_navImpl, k)) defMember(k, _navImpl[k]);
   }
 
   defGetter('webdriver', function() { return false; });
@@ -8379,12 +8418,16 @@ globalThis.navigator = {
   defGetter('hardwareConcurrency', function() { return globalThis.__obscura_hw || 8; });
   defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
 
-  _navProto.share = _markNative(function share(data) {
-    return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+  Object.defineProperty(Navigator.prototype, 'share', {
+    value: _markNative(function share(data) {
+      return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
+    }),
+    writable: true, enumerable: true, configurable: true,
   });
-  _navProto.canShare = _markNative(function canShare() { return false; });
-
-  Object.setPrototypeOf(globalThis.navigator, _navProto);
+  Object.defineProperty(Navigator.prototype, 'canShare', {
+    value: _markNative(function canShare() { return false; }),
+    writable: true, enumerable: true, configurable: true,
+  });
 })();
 
 globalThis.chrome = {
@@ -16625,10 +16668,10 @@ if (typeof PointerEvent === 'undefined') {
 }
 
 if (typeof navigator.credentials === 'undefined') {
-  navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
+  Navigator.prototype.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
 }
 
-navigator.mediaCapabilities = {
+Navigator.prototype.mediaCapabilities = {
   decodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
   },
@@ -16636,7 +16679,7 @@ navigator.mediaCapabilities = {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
   },
 };
-navigator.locks = {
+Navigator.prototype.locks = {
   request(name, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
     if (typeof cb === 'function') return Promise.resolve(cb({ name, mode: (opts && opts.mode) || 'exclusive' }));
@@ -16644,13 +16687,13 @@ navigator.locks = {
   },
   query() { return Promise.resolve({ held: [], pending: [] }); },
 };
-navigator.keyboard = {
+Navigator.prototype.keyboard = {
   getLayoutMap() { return Promise.resolve(new Map()); },
   lock() { return Promise.resolve(); },
   unlock() {},
 };
-navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
-navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+Navigator.prototype.gpu = { requestAdapter() { return Promise.resolve(null); } };
+Navigator.prototype.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
 globalThis.opener = null;
 
@@ -18569,6 +18612,16 @@ const _documentMembers = Object.freeze(Object.fromEntries([
 ]));
 
 globalThis.__obscura_init = (function() {
+  // deno_core installs EventTarget after the snapshot bootstrap runs, so the
+  // Navigator.prototype link made there cannot see it yet. Finish the chain
+  // here, where the page realm has it: navigator -> Navigator.prototype ->
+  // EventTarget.prototype -> Object.prototype.
+  try {
+    if (typeof EventTarget === 'function' &&
+        Object.getPrototypeOf(Navigator.prototype) !== EventTarget.prototype) {
+      Object.setPrototypeOf(Navigator.prototype, EventTarget.prototype);
+    }
+  } catch (e) {}
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
   _scriptingEnabled = _domParse('scripting_enabled') !== false;
@@ -18631,12 +18684,17 @@ globalThis.__obscura_init = (function() {
   // standalone runtime has the same 1x default as Obscura's render surface.
   globalThis.devicePixelRatio = 1;
   globalThis.innerWidth = vw; globalThis.innerHeight = vh;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
+  // outer* is the whole OS window: viewport plus browser chrome. A viewport
+  // that fills the screen means a maximized window matching the screen.
+  globalThis.outerWidth = vw >= sw ? sw : vw + 16;
+  globalThis.outerHeight = vh >= sh ? sh : vh + 80;
 
-  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  // Cores and memory are drawn together: 16 cores with 0.5 GB is not a real
+  // device, and Chrome caps deviceMemory at 8.
+  var hwMem = [[2, 4], [4, 4], [4, 8], [6, 8], [8, 8], [12, 8], [16, 8]];
+  var hwMemPick = hwMem[Math.floor(_fpRand(400) * hwMem.length)];
+  globalThis.__obscura_hw = hwMemPick[0];
+  globalThis.__obscura_mem = hwMemPick[1];
 
   const timing = {};
   for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
