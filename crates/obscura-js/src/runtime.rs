@@ -9905,6 +9905,84 @@ mod tests {
     }
 
     #[test]
+    fn email_constraint_validation_tracks_edits_and_dispatches_invalid() {
+        let mut rt = setup_runtime(r#"<html><body><form><input id="email" type="email"></form>
+            <fieldset disabled><legend><input id="legend" type="email" value="bad"></legend>
+                <input id="disabled" type="email" value="bad"></fieldset>
+            <datalist><input id="listed" type="email" value="bad"></datalist></body></html>"#);
+        let result = rt.evaluate(r#"
+            const input = document.getElementById('email');
+            const validity = input.validity;
+            const invalid = [];
+            let bubbled = 0;
+            input.parentElement.addEventListener('invalid', () => bubbled++);
+            input.addEventListener('invalid', event => {
+                invalid.push([event.target === input, event.bubbles, event.cancelable]);
+                event.preventDefault();
+            });
+            const cases = ['', 'bad', 'a@b', ' a@b\r\n ', 'a@-b', 'a@b-', 'a@b..c',
+                'a b@c', 'a@@b', 'a@' + 'b'.repeat(64), 'a@b,c@d', '\u00a0a@b',
+                'a@' + 'b'.repeat(63), 'a@\nb'].map(value => {
+                input.value = value;
+                return [input.value, validity.typeMismatch, input.checkValidity()];
+            });
+            input.setAttribute('multiple', '');
+            const multiple = ['', ' a@b, c@d ', 'a@b,', ',a@b', 'a@b,bad'].map(value => {
+                input.value = value;
+                return [input.value, validity.typeMismatch, input.checkValidity()];
+            });
+            input.removeAttribute('multiple');
+            input.setAttribute('required', '');
+            input.value = '';
+            const required = [validity.valueMissing, input.checkValidity(), input.validationMessage !== ''];
+            input.value = 'a@b';
+            input.setCustomValidity('blocked');
+            const custom = [validity.customError, validity.valid, input.reportValidity(), input.validationMessage];
+            input.value = 'bad';
+            input.setCustomValidity('');
+            const cleared = [validity.customError, validity.typeMismatch, validity.valid, input.checkValidity()];
+            input.setAttribute('disabled', '');
+            const disabled = [input.willValidate, input.checkValidity(), input.validationMessage];
+            input.removeAttribute('disabled');
+            input.readOnly = true;
+            const readonly = [input.willValidate, input.reportValidity(), input.validationMessage];
+            input.readOnly = false;
+            input.value = 'a@b';
+            const corrected = [validity === input.validity, validity.valid, input.checkValidity(), input.validationMessage];
+            const barred = ['legend', 'disabled', 'listed'].map(id => {
+                const field = document.getElementById(id);
+                return [field.willValidate, field.checkValidity()];
+            });
+            const barredCustom = ['disabled', 'readonly', 'hidden'].map(state => {
+                const field = document.createElement('input');
+                field.type = state === 'hidden' ? 'hidden' : 'text';
+                if (state !== 'hidden') field.setAttribute(state, '');
+                field.setCustomValidity('blocked');
+                let events = 0;
+                field.addEventListener('invalid', () => events++);
+                return [field.willValidate, field.checkValidity(), field.reportValidity(), events];
+            });
+            return { cases, multiple, required, custom, cleared, disabled, readonly, corrected, barred, barredCustom,
+                events: [invalid.length, invalid.every(event => JSON.stringify(event) === '[true,false,true]'), bubbled] };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "cases": [["", false, true], ["bad", true, false], ["a@b", false, true], ["a@b", false, true],
+                ["a@-b", true, false], ["a@b-", true, false], ["a@b..c", true, false], ["a b@c", true, false],
+                ["a@@b", true, false], [format!("a@{}", "b".repeat(64)), true, false],
+                ["a@b,c@d", true, false], ["\u{a0}a@b", true, false],
+                [format!("a@{}", "b".repeat(63)), false, true], ["a@b", false, true]],
+            "multiple": [["", false, true], ["a@b,c@d", false, true], ["a@b,", true, false],
+                [",a@b", true, false], ["a@b,bad", true, false]],
+            "required": [true, false, true], "custom": [true, false, false, "blocked"],
+            "cleared": [false, true, false, false], "disabled": [false, true, ""],
+            "readonly": [false, true, ""], "corrected": [true, true, true, ""],
+            "barred": [[true, false], [false, true], [false, true]],
+            "barredCustom": [[false, true, true, 0], [false, true, true, 0], [false, true, true, 0]],
+            "events": [15, true, 0]
+        }));
+    }
+
+    #[test]
     fn readonly_controls_reflect_boolean_attributes_without_polluting_other_elements() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt.evaluate(r#"
