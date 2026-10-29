@@ -4889,7 +4889,7 @@ class Element extends Node {
       return '';
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (_formValues[this._nid] !== undefined) return _sanitizeEmailValue(this, _formValues[this._nid]);
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -4908,7 +4908,7 @@ class Element extends Node {
         return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
       }
     }
-    return this.getAttribute("value") || "";
+    return _sanitizeEmailValue(this, this.getAttribute("value") || "");
   }
   // FileList for <input type=file>, populated by DOM.setFileInputFiles (Puppeteer
   // uploadFile / Playwright setInputFiles). null for non-file inputs, matching
@@ -4940,7 +4940,7 @@ class Element extends Node {
       }
       return;
     }
-    const value = String(v);
+    const value = _sanitizeEmailValue(this, String(v));
     _formValues[this._nid] = value;
     _dom("set_form_value", this._nid, value);
     if (tag === 'textarea') {
@@ -18919,12 +18919,44 @@ if (typeof ValidityState === 'undefined') {
 const _ns_validityCache = new WeakMap();
 const _ns_customValidityMsg = new WeakMap();
 
-// Element.prototype.validity - returns cached ValidityState for the element
+function _isEmailInput(element) {
+  return element.localName === 'input' && element._inputType() === 'email';
+}
+
+function _sanitizeEmailValue(element, value) {
+  if (!_isEmailInput(element)) return value;
+  const trim = token => token.replace(/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g, '');
+  return element.hasAttribute('multiple')
+    ? value.split(',').map(trim).join(',')
+    : trim(value.replace(/[\r\n]/g, ''));
+}
+
+// HTML's email grammar permits single-label domains and limits each label to 63 characters.
+const _emailAddressPattern = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+// Keep the cached object live when a caller retains input.validity across edits.
 if (!Element.prototype.validity) {
   Object.defineProperty(Element.prototype, 'validity', {
     get: function() {
       if (!_ns_validityCache.has(this)) {
-        _ns_validityCache.set(this, new ValidityState());
+        const element = this;
+        const validity = new ValidityState();
+        Object.defineProperties(validity, {
+          customError: { enumerable: true, get() { return _ns_customValidityMsg.has(element); } },
+          typeMismatch: { enumerable: true, get() {
+            if (!_isEmailInput(element) || element.value === '') return false;
+            const values = element.hasAttribute('multiple') ? element.value.split(',') : [element.value];
+            return values.some(value => !_emailAddressPattern.test(value));
+          } },
+          valueMissing: { enumerable: true, get() {
+            return _isEmailInput(element) && !element.readOnly && !_isActuallyDisabled(element)
+              && element.hasAttribute('required') && element.value === '';
+          } },
+          valid: { enumerable: true, get() {
+            return !this.customError && !this.typeMismatch && !this.valueMissing;
+          } },
+        });
+        _ns_validityCache.set(this, validity);
       }
       return _ns_validityCache.get(this);
     },
@@ -18937,36 +18969,50 @@ if (!Element.prototype.validity) {
 if (!Element.prototype.willValidate) {
   Object.defineProperty(Element.prototype, 'willValidate', {
     get: function() {
-      return true;
+      if (_isActuallyDisabled(this) || this.closest('datalist')) return false;
+      if (this.localName === 'input') {
+        const type = this._inputType();
+        if (['hidden', 'reset', 'button'].includes(type)) return false;
+        if (this.readOnly && ['text', 'search', 'url', 'tel', 'email', 'password',
+          'date', 'month', 'week', 'time', 'datetime-local', 'number'].includes(type)) return false;
+      }
+      if (this.localName === 'textarea' && this.readOnly) return false;
+      return !['fieldset', 'output'].includes(this.localName);
     },
     enumerable: true,
     configurable: true
   });
 }
 
-// Element.prototype.validationMessage - custom validation message if set
+// Element.prototype.validationMessage - active constraint or custom validation message
 if (!Element.prototype.validationMessage) {
   Object.defineProperty(Element.prototype, 'validationMessage', {
     get: function() {
-      return _ns_customValidityMsg.get(this) || '';
+      if (!this.willValidate) return '';
+      if (_ns_customValidityMsg.has(this)) return _ns_customValidityMsg.get(this);
+      if (this.validity.valueMissing) return 'Please fill out this field.';
+      if (this.validity.typeMismatch) return 'Please enter an email address.';
+      return '';
     },
     enumerable: true,
     configurable: true
   });
 }
 
-// Element.prototype.checkValidity - stub returns true
+// Check current constraints and dispatch the cancelable, non-bubbling invalid event.
 if (!Element.prototype.checkValidity) {
   Element.prototype.checkValidity = function checkValidity() {
-    return true;
+    if (!this.willValidate || this.validity.valid) return true;
+    this.dispatchEvent(new Event('invalid', { cancelable: true }));
+    return false;
   };
   _markNative(Element.prototype.checkValidity);
 }
 
-// Element.prototype.reportValidity - stub returns true
+// Headless validation reports the same result and event as checkValidity.
 if (!Element.prototype.reportValidity) {
   Element.prototype.reportValidity = function reportValidity() {
-    return true;
+    return this.checkValidity();
   };
   _markNative(Element.prototype.reportValidity);
 }
@@ -18974,16 +19020,9 @@ if (!Element.prototype.reportValidity) {
 // Element.prototype.setCustomValidity - set custom validation message
 if (!Element.prototype.setCustomValidity) {
   Element.prototype.setCustomValidity = function setCustomValidity(msg) {
-    const validity = this.validity;
-    if (msg && msg.length > 0) {
-      _ns_customValidityMsg.set(this, msg);
-      validity.customError = true;
-      validity.valid = false;
-    } else {
-      _ns_customValidityMsg.delete(this);
-      validity.customError = false;
-      validity.valid = true;
-    }
+    const message = String(msg);
+    if (message) _ns_customValidityMsg.set(this, message);
+    else _ns_customValidityMsg.delete(this);
   };
   _markNative(Element.prototype.setCustomValidity);
 }
