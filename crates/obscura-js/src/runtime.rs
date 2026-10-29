@@ -6271,6 +6271,99 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_receives_messages_through_every_handler_form() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-handler-forms",
+            r#"
+            globalThis.__workerReplies = {};
+            const original = window.onmessage;
+            const sources = {
+                bare: 'onmessage = e => postMessage("bare:" + e.data);',
+                viaSelf: 'self.onmessage = e => postMessage("viaSelf:" + e.data);',
+                viaGlobalThis: 'globalThis.onmessage = e => postMessage("viaGlobalThis:" + e.data);',
+                viaThis: 'this.onmessage = e => postMessage("viaThis:" + e.data);',
+                listener: 'addEventListener("message", e => postMessage("listener:" + e.data));',
+                selfListener: 'self.addEventListener("message", e => postMessage("selfListener:" + e.data));',
+                declared: 'var onmessage = e => postMessage("declared:" + e.data);',
+                // `self` redeclared at top level: same-scope let/const would be a SyntaxError
+                shadowedSelf: 'const self = this; self.onmessage = e => postMessage("shadowedSelf:" + e.data + ":" + (this === globalThis));',
+                // the handler is read back through the scope, and set late
+                lateBare: 'setTimeout(() => { onmessage = e => postMessage("lateBare:" + (typeof self.onmessage) + ":" + e.data); }, 0);',
+                strictBare: '"use strict"; onmessage = e => postMessage("strictBare:" + e.data);',
+            };
+            for (const [name, source] of Object.entries(sources)) {
+                const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+                const worker = new Worker(url);
+                worker.onmessage = event => {
+                    __workerReplies[name] = event.data;
+                    worker.terminate();
+                    URL.revokeObjectURL(url);
+                };
+                if (name === 'lateBare') setTimeout(() => worker.postMessage(name), 20);
+                else worker.postMessage(name);
+            }
+            globalThis.__workerWindowUnchanged = () => window.onmessage === original;
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerReplies").unwrap(),
+            serde_json::json!({
+                "bare": "bare:bare", "viaSelf": "viaSelf:viaSelf",
+                "viaGlobalThis": "viaGlobalThis:viaGlobalThis", "viaThis": "viaThis:viaThis",
+                "listener": "listener:listener", "selfListener": "selfListener:selfListener",
+                "declared": "declared:declared", "shadowedSelf": "shadowedSelf:shadowedSelf:true",
+                "lateBare": "lateBare:function:lateBare", "strictBare": "strictBare:strictBare",
+            })
+        );
+        assert_eq!(rt.evaluate("__workerWindowUnchanged()").unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_code_runs_about_as_fast_as_page_code() {
+        // Worker source used to run inside `with (scope)`, which V8 does not
+        // optimize (~45x slower). Compare against the page in one process so the
+        // assertion does not depend on the host's absolute speed.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-speed",
+            r#"
+            globalThis.__workerReplies = [];
+            const loop = `
+                function fnv(n) {
+                    let h = 0x811c9dc5;
+                    for (let i = 0; i < n; i++) { h ^= i & 255; h = Math.imul(h, 16777619) >>> 0; }
+                    return h;
+                }
+                fnv(1000);
+                var t0 = performance.now();
+                var hash = fnv(3000000);
+                var ms = performance.now() - t0;
+            `;
+            (0, eval)(loop);
+            globalThis.__mainMs = ms;
+            globalThis.__mainHash = hash;
+            const source = loop + 'postMessage({ ms, hash });';
+            const url = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            worker.onmessage = event => { __workerReplies.push(event.data); worker.terminate(); };
+        "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(200).await.unwrap();
+        let reply = rt.evaluate("__workerReplies[0]").unwrap();
+        let main_ms = rt.evaluate("__mainMs").unwrap().as_f64().unwrap();
+        let worker_ms = reply["ms"].as_f64().expect("worker reply");
+        assert_eq!(reply["hash"].as_f64(), rt.evaluate("__mainHash").unwrap().as_f64());
+        assert!(
+            worker_ms <= main_ms * 3.0 + 25.0,
+            "worker loop took {worker_ms} ms, page loop {main_ms} ms"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_initialization_error_does_not_rerun_source() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script(

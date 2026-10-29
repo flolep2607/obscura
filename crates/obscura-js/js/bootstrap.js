@@ -16800,10 +16800,30 @@ globalThis.Worker = class Worker {
     if (this._terminated || this._scope || this._code === undefined) return;
     const scope = this._makeScope();
     try {
-      // Direct eval preserves script directives and resolves bare handler names
-      // against the worker scope. Run once so message closures retain their state.
-      const fn = new Function('scope', 'source', 'with (scope) { eval(source); }');
-      fn.call(scope, scope, this._code);
+      // V8 does not optimize code lexically inside `with`, which made worker JS
+      // ~45x slower than the same code on the page. The worker-only globals are
+      // parameters of a Function instead; every other bare identifier resolves
+      // through the page global as before. `onmessage` is a parameter too (so a
+      // bare `onmessage = fn` or `var onmessage = fn` has a binding to assign) and
+      // scope.onmessage becomes an accessor over that binding.
+      const names = Object.getOwnPropertyNames(scope).filter(
+        (k) => /^[A-Za-z_$][\w$]*$/.test(k) && (k === 'onmessage' || scope[k] !== globalThis[k]));
+      const bind = (get, set) => Object.defineProperty(scope, 'onmessage', { get, set, enumerable: true, configurable: true });
+      // The bind call precedes the source, so a leading "use strict" is repeated
+      // ahead of it to stay a directive.
+      const strict = /^(?:\s|\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)*(['"])use strict\1/.test(this._code) ? '"use strict";\n' : '';
+      const head = strict + '__obscuraBind(() => onmessage, (v) => { onmessage = v; });\n';
+      let fn;
+      try {
+        fn = new Function(...names, '__obscuraBind', head + this._code + '\n');
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+        // A top-level let/const/class named like a parameter (`const self = this`)
+        // is a SyntaxError in the same scope; nothing has run yet, so retry with
+        // the source in a nested function, where it may shadow the parameter.
+        fn = new Function(...names, '__obscuraBind', head + 'return (function () {\n' + this._code + '\n}).call(this);');
+      }
+      fn.call(scope, ...names.map((k) => scope[k]), bind);
     } catch(e) {
       console.error('Worker error:', e.message);
       if (this.onerror) this.onerror(e);
