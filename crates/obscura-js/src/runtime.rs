@@ -17199,6 +17199,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn navigator_and_window_shape_match_chrome() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                (() => {
+                    const chain = [];
+                    let o = navigator;
+                    while (o) {
+                        chain.push(o.constructor && o.constructor.name);
+                        o = Object.getPrototypeOf(o);
+                    }
+                    return {
+                        protoLinked: Object.getPrototypeOf(navigator) === Navigator.prototype,
+                        ownProps: Object.getOwnPropertyNames(navigator).length,
+                        chain,
+                        npProtoIsEventTarget: Object.getPrototypeOf(Navigator.prototype) === EventTarget.prototype,
+                        userAgentAccessor: !!Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent'),
+                        webdriverAccessor: !!Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver'),
+                        windowTag: Object.prototype.toString.call(window),
+                    };
+                })()
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result["protoLinked"], serde_json::json!(true));
+        assert_eq!(result["ownProps"], serde_json::json!(0));
+        assert_eq!(result["npProtoIsEventTarget"], serde_json::json!(true));
+        assert_eq!(result["chain"].as_array().unwrap().len(), 4, "chain {}", result["chain"]);
+        assert_eq!(result["userAgentAccessor"], serde_json::json!(true));
+        assert_eq!(result["webdriverAccessor"], serde_json::json!(true));
+        assert_eq!(result["windowTag"], serde_json::json!("[object Window]"));
+    }
+
+    #[test]
+    fn cores_memory_and_window_geometry_are_coherent() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                ({
+                    hw: navigator.hardwareConcurrency,
+                    mem: navigator.deviceMemory,
+                    iw: innerWidth, ih: innerHeight,
+                    ow: outerWidth, oh: outerHeight,
+                    sw: screen.width, sh: screen.height,
+                })
+                "#,
+            )
+            .unwrap();
+        let hw = result["hw"].as_u64().unwrap();
+        let mem = result["mem"].as_u64().unwrap();
+        assert!((2..=16).contains(&hw), "unexpected core count {hw}");
+        assert!(mem == 4 || mem == 8, "unexpected device memory {mem}");
+        assert!(result["ow"].as_u64().unwrap() >= result["iw"].as_u64().unwrap());
+        assert!(result["oh"].as_u64().unwrap() >= result["ih"].as_u64().unwrap());
+        assert!(result["ow"].as_u64().unwrap() <= result["sw"].as_u64().unwrap());
+        assert!(result["oh"].as_u64().unwrap() <= result["sh"].as_u64().unwrap());
+    }
+
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
     async fn canvas_2d_live_backing_paints_immediately_with_scaling_clips_and_effects() {
