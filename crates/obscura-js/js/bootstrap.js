@@ -18635,8 +18635,8 @@ globalThis.__obscura_init = (function() {
 
   var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
   globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  // Chrome caps deviceMemory at 8; a random low value (0.25..4) next to 12 cores is incoherent.
+  globalThis.__obscura_mem = 8;
 
   const timing = {};
   for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
