@@ -16697,6 +16697,21 @@ Navigator.prototype.wakeLock = { request() { return Promise.reject(new DOMExcept
 
 globalThis.opener = null;
 
+const WORKER_GLOBALS = [
+  'Object', 'Function', 'Array', 'Number', 'parseFloat', 'parseInt', 'Infinity', 'NaN', 'undefined',
+  'Boolean', 'String', 'Symbol', 'Date', 'Promise', 'RegExp', 'Error', 'AggregateError', 'EvalError',
+  'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'JSON', 'Math', 'Intl',
+  'ArrayBuffer', 'SharedArrayBuffer', 'Atomics', 'Uint8Array', 'Int8Array', 'Uint16Array', 'Int16Array',
+  'Uint32Array', 'Int32Array', 'Float32Array', 'Float64Array', 'Uint8ClampedArray', 'BigUint64Array',
+  'BigInt64Array', 'DataView', 'Map', 'BigInt', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
+  'FinalizationRegistry', 'Proxy', 'Reflect', 'WebAssembly', 'decodeURI', 'decodeURIComponent',
+  'encodeURI', 'encodeURIComponent', 'escape', 'unescape', 'isFinite', 'isNaN',
+  'queueMicrotask', 'structuredClone', 'URL', 'URLSearchParams', 'Blob', 'File', 'FormData', 'Headers',
+  'Request', 'Response', 'AbortController', 'AbortSignal', 'Event', 'CustomEvent', 'EventTarget',
+  'MessageChannel', 'MessagePort', 'BroadcastChannel', 'ReadableStream', 'WritableStream',
+  'TransformStream', 'XMLHttpRequest', 'WebSocket', 'indexedDB', 'navigator', 'DOMException',
+];
+
 globalThis.Worker = class Worker {
   constructor(url) {
     this.onmessage = null;
@@ -16766,6 +16781,19 @@ globalThis.Worker = class Worker {
       location: globalThis.location,
     };
     scope.self = scope;
+    // A worker global carries the ECMAScript builtins and the worker-visible
+    // web APIs as properties. Bare identifiers already resolved through the
+    // page global via `with (scope)`, but code that treats `self` as the global
+    // object (Go's wasm_exec runs with `global = self`, reading `self.Object`,
+    // `self.Promise`, `self.JSON`, ...) saw undefined and the wasm panicked with
+    // "syscall/js: call of Value.Invoke on undefined".
+    for (const name of WORKER_GLOBALS) {
+      if (!(name in scope) && name in globalThis) {
+        Object.defineProperty(scope, name, { value: globalThis[name], writable: true, configurable: true });
+      }
+    }
+    // Bare `globalThis` inside a worker is the worker scope, not the page window.
+    Object.defineProperty(scope, 'globalThis', { value: scope, writable: true, configurable: true });
     return scope;
   }
   _autoRun() {
