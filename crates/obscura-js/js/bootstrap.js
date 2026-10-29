@@ -130,11 +130,6 @@ Object.defineProperty(globalThis, "__obscura_binding_called", {
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
-globalThis.onunhandledrejection = function(e) { if (e?.preventDefault) e.preventDefault(); };
-
-globalThis.onerror = function(msg, src, line, col, error) {
-  globalThis.__obscura_errors.push({msg: String(msg), src: String(src||""), line, error: String(error||"")});
-};
 globalThis.addEventListener = function(type, fn, options) {
   _eventTargetAdd(globalThis, type, fn, options);
 };
@@ -7892,32 +7887,71 @@ globalThis.length = 0;
 // event path through these: jQuery checks `("on" + ev) in window`, and React
 // decides whether the `input` event is supported via `("oninput" in document)`.
 // When that check fails React falls back to a legacy change-detection path that
-// never fires onChange for controlled inputs (issue #324). Initialising these to
-// null on all three targets makes the checks match real browsers. On Document and
-// Element they are non-enumerable so they don't surface in `for..in` over nodes.
-for (const _ev of [
-  "abort","beforeprint","beforeunload","blur","cancel","canplay","canplaythrough",
-  "change","click","close","contextmenu","cuechange","dblclick","drag","dragend",
-  "dragenter","dragleave","dragover","dragstart","drop","durationchange","emptied",
-  "ended","error","focus","focusin","focusout","formdata","gotpointercapture",
-  "hashchange","input","invalid","keydown","keypress","keyup","languagechange",
-  "load","loadeddata","loadedmetadata","loadstart","lostpointercapture","message",
-  "mousedown","mouseenter","mouseleave","mousemove","mouseout","mouseover","mouseup",
-  "offline","online","pagehide","pageshow","paste","pause","play","playing",
-  "pointercancel","pointerdown","pointerenter","pointerleave","pointermove",
-  "pointerout","pointerover","pointerup","popstate","progress","ratechange",
-  "rejectionhandled","reset","resize","scroll","seeked","seeking","select",
-  "stalled","storage","submit","suspend","timeupdate","toggle","unhandledrejection",
-  "unload","volumechange","waiting","wheel",
-]) {
-  const _on = "on" + _ev;
-  if (!(_on in globalThis)) globalThis[_on] = null;
-  for (const _proto of [Document.prototype, Element.prototype]) {
-    if (!(_on in _proto)) {
-      Object.defineProperty(_proto, _on, { value: null, writable: true, configurable: true, enumerable: false });
-    }
+// never fires onChange for controlled inputs (issue #324).
+//
+// Browsers define them as configurable accessor properties on the prototype;
+// zone.js (Angular) replaces them with its own accessors through
+// Object.defineProperty / getOwnPropertyDescriptor on those prototypes, and
+// feature-detects by installing a getter-only `onreadystatechange` on
+// XMLHttpRequest.prototype and constructing an XHR, which throws if the
+// constructor assigns the property. The handler lives in a hidden slot on the
+// instance; only functions are kept, anything else reads back as null.
+const _eventHandlerSlots = new Map();
+function _eventHandlerSlot(on) {
+  let slot = _eventHandlerSlots.get(on);
+  if (!slot) _eventHandlerSlots.set(on, slot = Symbol(on));
+  return slot;
+}
+// What the engine fires for `on<type>`: the slot, never the public property.
+// zone.js (and any page) may replace the accessor with one that also registers
+// a listener; reading through it would run the handler twice, and zone 0.8's
+// getter can throw outright for non-elements.
+function _eventHandlerOf(target, on) {
+  const h = target[_eventHandlerSlot(on)];
+  return typeof h === "function" ? h : null;
+}
+function _defineEventHandlers(target, names, enumerable = true) {
+  for (const name of names) {
+    const on = "on" + name;
+    const old = Object.getOwnPropertyDescriptor(target, on);
+    if (old && old.get) continue;
+    const slot = _eventHandlerSlot(on);
+    Object.defineProperty(target, on, {
+      get() { const h = this[slot]; return h === undefined ? null : h; },
+      set(v) { this[slot] = typeof v === "function" ? v : null; },
+      enumerable,
+      configurable: true,
+    });
   }
 }
+const _eventHandlerNames = [
+  "abort","afterprint","animationcancel","animationend","animationiteration","animationstart",
+  "auxclick","beforecopy","beforecut","beforeinput","beforematch","beforepaste","beforeprint",
+  "beforetoggle","beforeunload","blur","cancel","canplay","canplaythrough","change","click",
+  "close","contextmenu","copy","cuechange","cut","dblclick","devicemotion","deviceorientation",
+  "deviceorientationabsolute","drag","dragend","dragenter","dragleave","dragover","dragstart",
+  "drop","durationchange","emptied","ended","error","focus","focusin","focusout","formdata",
+  "fullscreenchange","fullscreenerror","freeze","gotpointercapture","hashchange","input",
+  "invalid","keydown","keypress","keyup","languagechange","load","loadeddata","loadedmetadata",
+  "loadstart","lostpointercapture","message","messageerror","mousedown","mouseenter",
+  "mouseleave","mousemove","mouseout","mouseover","mouseup","offline","online","pagehide",
+  "pageshow","paste","pause","play","playing","pointercancel","pointerdown","pointerenter",
+  "pointerleave","pointerlockchange","pointerlockerror","pointermove","pointerout",
+  "pointerover","pointerrawupdate","pointerup","popstate","progress","ratechange",
+  "readystatechange","rejectionhandled","reset","resize","resume","scroll","scrollend",
+  "search","securitypolicyviolation","seeked","seeking","select","selectionchange",
+  "selectstart","slotchange","stalled","storage","submit","suspend","timeupdate","toggle",
+  "touchcancel","touchend","touchmove","touchstart","transitioncancel","transitionend",
+  "transitionrun","transitionstart","unhandledrejection","unload","visibilitychange",
+  "volumechange","waiting","webkitanimationend","webkitanimationiteration",
+  "webkitanimationstart","webkitfullscreenchange","webkitfullscreenerror",
+  "webkittransitionend","wheel",
+];
+// Document and Element keep them non-enumerable so they don't surface in
+// for..in over nodes.
+_defineEventHandlers(globalThis, _eventHandlerNames);
+_defineEventHandlers(Document.prototype, _eventHandlerNames, false);
+_defineEventHandlers(Element.prototype, _eventHandlerNames, false);
 
 let _windowOnloadOverrideSet = false;
 let _windowOnloadOverride = null;
@@ -8705,13 +8739,15 @@ class XMLHttpRequestEventTarget {
     const type = ev.type;
     const handlers = (this._listeners && this._listeners[type]) || [];
     for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
-    const prop = 'on' + type;
-    if (typeof this[prop] === 'function') {
-      try { this[prop](ev); } catch (e) {}
+    const handler = _eventHandlerOf(this, 'on' + type);
+    if (handler) {
+      try { handler.call(this, ev); } catch (e) {}
     }
     return true;
   }
 }
+_defineEventHandlers(XMLHttpRequestEventTarget.prototype,
+  ["loadstart", "progress", "abort", "error", "load", "timeout", "loadend"]);
 globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
 _markNative(XMLHttpRequestEventTarget);
 _markNative(XMLHttpRequestEventTarget.prototype.addEventListener);
@@ -8745,14 +8781,6 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     this._responseHeaders = {};
     this._aborted = false;
     this._listeners = {};
-    this.onreadystatechange = null;
-    this.onload = null;
-    this.onerror = null;
-    this.onabort = null;
-    this.onprogress = null;
-    this.ontimeout = null;
-    this.onloadstart = null;
-    this.onloadend = null;
   }
 
   open(method, url, async_) {
@@ -8870,11 +8898,11 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
         xhr._aborted = true;
         xhr._fireEvent('abort');
         xhr._fireEvent('loadend');
-        if (xhr.onabort) xhr.onabort(err);
+        const onabort = _eventHandlerOf(xhr, 'onabort'); if (onabort) onabort.call(xhr, err);
       } else {
         xhr._fireEvent('error');
         xhr._fireEvent('loadend');
-        if (xhr.onerror) xhr.onerror(err);
+        const onerror = _eventHandlerOf(xhr, 'onerror'); if (onerror) onerror.call(xhr, err);
       }
     });
   }
@@ -8910,9 +8938,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     const type = ev.type;
     const handlers = (this._listeners && this._listeners[type]) || [];
     for (const h of handlers) { try { h.call(this, ev); } catch (e) {} }
-    const prop = 'on' + type;
-    if (typeof this[prop] === 'function') {
-      try { this[prop](ev); } catch (e) {}
+    const handler = _eventHandlerOf(this, 'on' + type);
+    if (handler) {
+      try { handler.call(this, ev); } catch (e) {}
     }
     return true;
   }
@@ -8920,8 +8948,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   _setReadyState(state) {
     this.readyState = state;
     this._fireEvent('readystatechange');
-    if (this.onreadystatechange) {
-      try { this.onreadystatechange(); } catch(e) {}
+    const handler = _eventHandlerOf(this, 'onreadystatechange');
+    if (handler) {
+      try { handler.call(this); } catch(e) {}
     }
   }
 
@@ -8929,12 +8958,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     const event = { type, target: this, currentTarget: this, bubbles: false };
     const handlers = this._listeners[type] || [];
     for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
-    const prop = 'on' + type;
-    if (type !== 'readystatechange' && typeof this[prop] === 'function') {
-      try { this[prop](event); } catch(e) {}
+    const handler = type !== 'readystatechange' && _eventHandlerOf(this, 'on' + type);
+    if (handler) {
+      try { handler.call(this, event); } catch(e) {}
     }
   }
 };
+_defineEventHandlers(XMLHttpRequest.prototype, ["readystatechange"]);
 _markNative(XMLHttpRequest);
 _markNative(XMLHttpRequest.prototype.open);
 _markNative(XMLHttpRequest.prototype.send);
@@ -14271,6 +14301,22 @@ globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
+// The rest of the HTMLElement interfaces share Element like the aliases above.
+// Libraries touch them by name (zone.js patches HTMLFrameSetElement.prototype
+// and HTMLFrameElement.prototype unguarded), so a missing global is a
+// ReferenceError that aborts the whole bundle.
+for (const _name of [
+  "HTMLAreaElement", "HTMLBaseElement", "HTMLDataElement", "HTMLDirectoryElement",
+  "HTMLDListElement", "HTMLEmbedElement", "HTMLFontElement", "HTMLFrameElement",
+  "HTMLFrameSetElement", "HTMLMapElement", "HTMLMarqueeElement", "HTMLMenuElement",
+  "HTMLMeterElement", "HTMLModElement", "HTMLObjectElement", "HTMLOptGroupElement",
+  "HTMLOutputElement", "HTMLParamElement", "HTMLPictureElement", "HTMLQuoteElement",
+  "HTMLSourceElement", "HTMLTableCaptionElement", "HTMLTableCellElement",
+  "HTMLTableColElement", "HTMLTableRowElement", "HTMLTableSectionElement",
+  "HTMLTimeElement", "HTMLTitleElement",
+]) {
+  if (!(_name in globalThis)) globalThis[_name] = Element;
+}
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.
@@ -14508,6 +14554,7 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+if (!("HTMLDocument" in globalThis)) globalThis.HTMLDocument = Document;
 // CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
 // pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
 // interfaces it had no value assignment, leaving `window.CSSStyleDeclaration`
@@ -16514,8 +16561,6 @@ globalThis.opener = null;
 
 globalThis.Worker = class Worker {
   constructor(url) {
-    this.onmessage = null;
-    this.onerror = null;
     this._terminated = false;
     this._listeners = {};
     this._scope = null;
@@ -16540,7 +16585,7 @@ globalThis.Worker = class Worker {
           const resp = await fetch(resolvedUrl);
           worker._code = await resp.text();
           if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
+        } catch(e) { const onerror = _eventHandlerOf(worker, 'onerror'); if (onerror) onerror.call(worker, e); }
       })();
     }
   }
@@ -16553,7 +16598,7 @@ globalThis.Worker = class Worker {
       postMessage: (msg) => {
         if (worker._terminated) return;
         const evt = { data: msg };
-        if (worker.onmessage) worker.onmessage(evt);
+        const onmessage = _eventHandlerOf(worker, 'onmessage'); if (onmessage) onmessage.call(worker, evt);
         const ls = worker._listeners['message'] || [];
         for (const h of ls) h(evt);
       },
@@ -16593,7 +16638,7 @@ globalThis.Worker = class Worker {
       fn.call(scope, scope, this._code);
     } catch(e) {
       console.error('Worker error:', e.message);
-      if (this.onerror) this.onerror(e);
+      const onerror = _eventHandlerOf(this, 'onerror'); if (onerror) onerror.call(this, e);
     } finally {
       if (!this._terminated) {
         this._scope = scope;
@@ -16618,7 +16663,7 @@ globalThis.Worker = class Worker {
         for (const handler of evs.slice()) handler.call(scope, event);
       } catch(e) {
         console.error('Worker error:', e.message);
-        if (worker.onerror) worker.onerror(e);
+        const onerror = _eventHandlerOf(worker, 'onerror'); if (onerror) onerror.call(worker, e);
       }
     }, 0);
   }
@@ -16635,6 +16680,7 @@ globalThis.Worker = class Worker {
     if (this._listeners[type]) this._listeners[type] = this._listeners[type].filter(h => h !== fn);
   }
 };
+_defineEventHandlers(globalThis.Worker.prototype, ["error", "message", "messageerror"]);
 
 globalThis.__blobStore = globalThis.__blobStore || {};
 URL.createObjectURL = function(blob) {
@@ -17450,8 +17496,6 @@ if (typeof FileReader === 'undefined') {
   globalThis.FileReader = class FileReader {
     constructor() {
       this.result = null; this.error = null; this.readyState = 0; // EMPTY
-      this.onloadstart = null; this.onprogress = null; this.onload = null;
-      this.onabort = null; this.onerror = null; this.onloadend = null;
       this._listeners = {};
     }
     get [Symbol.toStringTag]() { return "FileReader"; }
@@ -17486,13 +17530,14 @@ if (typeof FileReader === 'undefined') {
     }
     _fire(type) {
       const ev = { type: type, target: this, currentTarget: this, lengthComputable: false, loaded: 0, total: 0 };
-      const h = this["on" + type]; if (typeof h === "function") { try { h.call(this, ev); } catch (e) {} }
+      const h = _eventHandlerOf(this, "on" + type); if (h) { try { h.call(this, ev); } catch (e) {} }
       const ls = this._listeners[type]; if (ls) for (const fn of ls.slice()) { try { fn.call(this, ev); } catch (e) {} }
     }
     addEventListener(t, fn) { if (typeof fn === "function") (this._listeners[t] = this._listeners[t] || []).push(fn); }
     removeEventListener(t, fn) { const ls = this._listeners[t]; if (ls) { const i = ls.indexOf(fn); if (i >= 0) ls.splice(i, 1); } }
     dispatchEvent() { return true; }
   };
+  _defineEventHandlers(globalThis.FileReader.prototype, ["loadstart", "progress", "load", "abort", "error", "loadend"]);
   globalThis.FileReader.EMPTY = 0; globalThis.FileReader.LOADING = 1; globalThis.FileReader.DONE = 2;
   Object.assign(globalThis.FileReader.prototype, { EMPTY: 0, LOADING: 1, DONE: 2 });
 }
@@ -17537,19 +17582,19 @@ if (typeof EventSource === 'undefined') {
       this.url = url;
       this.readyState = 0; // CONNECTING
       this.withCredentials = !!(init && init.withCredentials);
-      this.onopen = null; this.onmessage = null; this.onerror = null;
       _makeListenerBox(this);
       Promise.resolve().then(() => {
         if (this.readyState !== 0) return;
         this.readyState = 1; // OPEN
         const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
+        const onopen = _eventHandlerOf(this, 'onopen'); if (onopen) { try { onopen.call(this, ev); } catch (e) {} }
         try { this.dispatchEvent(ev); } catch (e) {}
       });
     }
     close() { this.readyState = 2; }
     static CONNECTING = 0; static OPEN = 1; static CLOSED = 2;
   };
+  _defineEventHandlers(globalThis.EventSource.prototype, ["open", "error", "message"]);
 }
 
 if (typeof WebSocket === 'undefined') {
@@ -17568,13 +17613,12 @@ if (typeof WebSocket === 'undefined') {
       this.binaryType = 'blob';
       this.extensions = '';
       this.protocol = Array.isArray(protocols) ? (protocols[0] || '') : (protocols || '');
-      this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
       _makeListenerBox(this);
       Promise.resolve().then(() => {
         if (this.readyState !== 0) return;
         this.readyState = 1; // OPEN
         const ev = new Event('open');
-        if (typeof this.onopen === 'function') { try { this.onopen(ev); } catch (e) {} }
+        const onopen = _eventHandlerOf(this, 'onopen'); if (onopen) { try { onopen.call(this, ev); } catch (e) {} }
         try { this.dispatchEvent(ev); } catch (e) {}
       });
     }
@@ -17584,11 +17628,12 @@ if (typeof WebSocket === 'undefined') {
       this.readyState = 3; // CLOSED
       const ev = new Event('close');
       ev.code = code || 1000; ev.reason = reason || ''; ev.wasClean = true;
-      if (typeof this.onclose === 'function') { try { this.onclose(ev); } catch (e) {} }
+      const onclose = _eventHandlerOf(this, 'onclose'); if (onclose) { try { onclose.call(this, ev); } catch (e) {} }
       try { this.dispatchEvent(ev); } catch (e) {}
     }
     static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
   };
+  _defineEventHandlers(globalThis.WebSocket.prototype, ["open", "error", "close", "message"]);
 }
 
 if (typeof BroadcastChannel === 'undefined') {
