@@ -3155,14 +3155,28 @@ impl Page {
         if duration_ms == 0 {
             return;
         }
-        if let Some(js) = &mut self.js {
-            Self::settle_runtime_for_duration(js, duration_ms).await;
+        // A fixed wait must retain its full wall clock, but a frame created
+        // during the wait still has to run its own deferred work: an iframe
+        // that only advances once at the end never gets to run the timers its
+        // document script scheduled, which strands iframe widgets (Turnstile,
+        // OAuth popups) for the whole delay. Pump in short slices and advance
+        // the frame tree between them until the deadline.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            let slice = remaining.min(std::time::Duration::from_millis(100));
+            let started = tokio::time::Instant::now();
+            if let Some(js) = &mut self.js {
+                let _ = js.run_event_loop_for_duration(slice.as_millis() as u64).await;
+            }
+            self.advance_frames().await;
+            // `run_event_loop_for_duration` returns as soon as the loop is
+            // idle. Sleep out the rest of the slice so page timers scheduled
+            // later still fire, and so a quiet page does not busy-spin.
+            let used = started.elapsed();
+            if used < slice {
+                tokio::time::sleep(slice - used).await;
+            }
         }
-        // A fixed wait must retain its full wall clock, so frames get their
-        // realms once at the end instead of being interleaved as in `settle`.
-        // Their document scripts still run; only their own deferred work is
-        // left for a later settle.
-        self.advance_frames().await;
     }
 
     /// Advance one wake-driven browser task for a continuously owned page.
@@ -7011,7 +7025,9 @@ mod tests {
                     let read = socket.read(&mut buf).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..read]).to_string();
                     let body = if request.starts_with("GET /child.html ") {
-                        "<html><body><script>window.__ran = 'YES';</script></body></html>"
+                        "<html><body><script>window.__ran = 'YES';\
+                         setTimeout(function(){ window.__timer = 'YES'; }, 10);\
+                         </script></body></html>"
                     } else if request.starts_with("GET /plain.html ") {
                         "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
                     } else {
@@ -7837,6 +7853,31 @@ mod tests {
             .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
             .unwrap();
         assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+    }
+
+    /// A fixed-duration settle keeps its wall clock but must still advance the
+    /// frame tree while it waits. Advancing once at the end runs the frame's
+    /// document scripts but strands the timers they scheduled, which is what an
+    /// iframe widget (Turnstile, OAuth popups) depends on to make progress.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fixed_duration_settle_runs_a_frames_deferred_work() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("shadow-frame-fixed-settle");
+        page.navigate(&base).await.unwrap();
+        page.settle_for_duration(1_000).await;
+
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "the shadow-root frame never appeared: {:?}",
+            page.frame_urls()
+        );
+        assert_eq!(
+            page.evaluate_in_frame(0, "globalThis.__timer").unwrap(),
+            serde_json::json!("YES"),
+            "the frame's timer never ran under a fixed-duration settle",
+        );
     }
 
     /// The sweep still does its job: an iframe removed from the document has
