@@ -42,14 +42,15 @@ pub fn is_blocked(host: &str) -> bool {
 /// Telemetry and beacon endpoints the Peter Lowe list misses, seen on retail product pages (2026-11). They
 /// only receive events: a page's content never depends on them, and each one cost a TCP+TLS connection per page, up
 /// to 46 at once for the Bazaarvoice beacon. Review and widget hosts (apps.bazaarvoice.com, yotpo) are not here:
-/// they put text in the page.
+/// they put text in the page. Dynatrace is not here either: blocking its RUM agent made several retail
+/// pages run twice the requests and take twice as long (bisected 2026-11-05), so a "beacon" is not always
+/// safe to drop. Check each addition against a before/after page load.
 static EXTRA_DOMAINS: &[&str] = &[
     "network-a.bazaarvoice.com",
     "monorail-edge.shopifysvc.com",
     "otlp-http-production.shopifysvc.com",
     "riskified.com",
     "analytics.org.coveo.com",
-    "dynatrace.com",
     "cquotient.com",
     "attraqt.io",
     "pixels.spotify.com",
