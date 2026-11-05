@@ -4573,44 +4573,87 @@ async fn fetch_url_inner(
         && (!is_cors_safelisted_method(&req_method) || !unsafe_header_names.is_empty());
 
     if needs_preflight {
-        let mut preflight_request = client
-            .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
-            .header("Origin", &page_origin)
-            .header("Access-Control-Request-Method", method.as_str());
-        if !unsafe_header_names.is_empty() {
-            preflight_request = preflight_request.header(
-                "Access-Control-Request-Headers",
-                unsafe_header_names.join(","),
-            );
-        }
-        let preflight = obscura_net::send_with_aia(
-            preflight_request,
-            allow_private_network,
-            proxy_url.as_deref(),
-        )
-        .await
-        .map_err(|e| {
-                deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
-            })?;
+        // A stealth page sends the preflight over the stealth transport too: the plain client has another TLS
+        // fingerprint and opened a fresh HTTP/1.1 connection for every preflight.
+        #[cfg(feature = "stealth")]
+        let stealth_preflight = {
+            let st = state.borrow();
+            let gs = st.borrow::<SharedState>().clone();
+            let client = gs.borrow().stealth_client.clone();
+            client
+        };
+        #[cfg(feature = "stealth")]
+        let stealth_reply = match stealth_preflight {
+            Some(stealth) => {
+                let mut headers = std::collections::HashMap::from([
+                    ("Origin".to_string(), page_origin.clone()),
+                    ("Access-Control-Request-Method".to_string(), method.clone()),
+                ]);
+                if !unsafe_header_names.is_empty() {
+                    headers.insert("Access-Control-Request-Headers".to_string(), unsafe_header_names.join(","));
+                }
+                let target = url::Url::parse(&url).map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+                let reply = stealth
+                    .send_single("OPTIONS", &target, &headers, &[], false, false)
+                    .await
+                    .map_err(|e| deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e)))?;
+                let mut map = reqwest::header::HeaderMap::new();
+                for (name, value) in reply.headers {
+                    if let (Ok(name), Ok(value)) = (
+                        reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                        reqwest::header::HeaderValue::from_str(&value),
+                    ) {
+                        map.append(name, value);
+                    }
+                }
+                Some((reply.status, map))
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "stealth"))]
+        let stealth_reply: Option<(u16, reqwest::header::HeaderMap)> = None;
+        let (preflight_status, preflight_headers) = match stealth_reply {
+            Some(reply) => reply,
+            None => {
+                let mut preflight_request = client
+                    .request(reqwest::Method::OPTIONS, &url)
+                    .timeout(fetch_timeout())
+                    .header("Origin", &page_origin)
+                    .header("Access-Control-Request-Method", method.as_str());
+                if !unsafe_header_names.is_empty() {
+                    preflight_request = preflight_request.header(
+                        "Access-Control-Request-Headers",
+                        unsafe_header_names.join(","),
+                    );
+                }
+                let preflight = obscura_net::send_with_aia(
+                    preflight_request,
+                    allow_private_network,
+                    proxy_url.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                        deno_error::JsErrorBox::generic(format!("CORS preflight failed: {}", e))
+                    })?;
+                (preflight.status().as_u16(), preflight.headers().clone())
+            }
+        };
 
         // Fetch spec: the preflight response's status must be an ok status
         // before its CORS headers are consulted (#973).
-        if !preflight.status().is_success() {
+        if !(200..300).contains(&preflight_status) {
             return Err(deno_error::JsErrorBox::generic(format!(
                 "CORS preflight returned HTTP {}",
-                preflight.status()
+                preflight_status
             )));
         }
 
-        let allowed_origin = preflight
-            .headers()
+        let allowed_origin = preflight_headers
             .get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let allow_credentials = preflight
-            .headers()
+        let allow_credentials = preflight_headers
             .get("access-control-allow-credentials")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
@@ -4622,14 +4665,14 @@ async fn fetch_url_inner(
         }
 
         let allowed_methods =
-            parse_cors_header_list(preflight.headers(), "access-control-allow-methods")
+            parse_cors_header_list(&preflight_headers, "access-control-allow-methods")
         .ok_or_else(|| {
             deno_error::JsErrorBox::generic(
                 "CORS preflight returned an invalid Access-Control-Allow-Methods value",
             )
         })?;
         let allowed_headers =
-            parse_cors_header_list(preflight.headers(), "access-control-allow-headers")
+            parse_cors_header_list(&preflight_headers, "access-control-allow-headers")
         .ok_or_else(|| {
             deno_error::JsErrorBox::generic(
                 "CORS preflight returned an invalid Access-Control-Allow-Headers value",

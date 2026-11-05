@@ -2478,6 +2478,10 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        // A stealth page fetches its scripts over the stealth transport too: the plain client has a different TLS
+        // fingerprint and speaks HTTP/1.1, so it opened one extra connection per parallel script and per host.
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let script_initiator = self
             .url
@@ -2487,6 +2491,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -2519,10 +2525,24 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
+                    #[cfg(feature = "stealth")]
+                    let fetched = match &stealth_client {
+                        Some(stealth) => {
+                            stealth
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                                .await
+                        }
+                        None => {
+                            client
+                                .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                                .await
+                        }
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let fetched = client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
-                    {
+                        .await;
+                    match fetched {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
