@@ -39,7 +39,22 @@ pub fn is_blocked(host: &str) -> bool {
     false
 }
 
-static EXTRA_DOMAINS: &[&str] = &[];
+/// Telemetry and beacon endpoints the Peter Lowe list misses, seen on retail product pages (2026-11). They
+/// only receive events: a page's content never depends on them, and each one cost a TCP+TLS connection per page, up
+/// to 46 at once for the Bazaarvoice beacon. Review and widget hosts (apps.bazaarvoice.com, yotpo) are not here:
+/// they put text in the page.
+static EXTRA_DOMAINS: &[&str] = &[
+    "network-a.bazaarvoice.com",
+    "monorail-edge.shopifysvc.com",
+    "otlp-http-production.shopifysvc.com",
+    "riskified.com",
+    "analytics.org.coveo.com",
+    "dynatrace.com",
+    "cquotient.com",
+    "attraqt.io",
+    "pixels.spotify.com",
+    "c360a.salesforce.com",
+];
 
 #[cfg(test)]
 mod tests {
@@ -68,6 +83,15 @@ mod tests {
     fn test_pgl_domains() {
         assert!(is_blocked("adnxs.com"));
         assert!(is_blocked("criteo.com"));
+    }
+
+    #[test]
+    fn test_extra_telemetry_domains_are_blocked_but_widgets_are_not() {
+        assert!(is_blocked("network-a.bazaarvoice.com"));
+        assert!(is_blocked("beacon.riskified.com"));
+        assert!(is_blocked("examplestoreprod1.analytics.org.coveo.com"));
+        assert!(!is_blocked("apps.bazaarvoice.com"));
+        assert!(!is_blocked("cdn.shopify.com"));
     }
 
     #[test]
