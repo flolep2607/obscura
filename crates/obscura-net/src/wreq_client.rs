@@ -215,6 +215,105 @@ fn chain_reaches_bundled_root(chain: &[Vec<u8>]) -> bool {
     crate::aia::tip_issuer_name(chain).is_some_and(|issuer| subjects.contains(&issuer))
 }
 
+/// What makes two stealth clients interchangeable: proxy, SSRF gate and the custom-CA environment `build_client` reads.
+#[cfg(feature = "stealth")]
+type ClientKey = (Option<String>, bool, Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+
+#[cfg(feature = "stealth")]
+static SHARED_CLIENTS: std::sync::OnceLock<std::sync::Mutex<HashMap<ClientKey, (wreq::Client, u64)>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "stealth")]
+fn client_key(proxy_url: Option<&str>, allow_private_network: bool) -> ClientKey {
+    (
+        proxy_url.map(str::to_string),
+        allow_private_network,
+        std::env::var_os("SSL_CERT_FILE"),
+        std::env::var_os("SSL_CERT_DIR"),
+    )
+}
+
+/// Single-flight dialing per origin. The pool cannot know before the handshake whether an origin speaks HTTP/2, so N
+/// parallel requests to an origin with no live connection each dial their own TCP+TLS connection and all but one are
+/// dropped after the handshake (measured: 1 in 5 connections of a page load, 30 at once for one product page). The
+/// first request to such an origin goes alone (the scout); the others wait for its response headers and then find the
+/// pooled HTTP/2 connection, or dial in parallel when the origin turned out to be HTTP/1.1. An origin counts as having
+/// a live connection only while a request that already got its headers is still running: servers close HTTP/2
+/// connections as soon as a response ends (measured: a document's connection closed 0.3 s before the page's script
+/// burst), so any timer-based "warm" window let that burst dial 30 connections in parallel. A scout that fails or
+/// hangs holds nobody up for longer than `SCOUT_WAIT`.
+#[cfg(feature = "stealth")]
+pub(crate) struct DialGate {
+    scout: Arc<tokio::sync::Mutex<()>>,
+    /// Requests that got their response headers and have not finished yet.
+    proven: std::sync::atomic::AtomicU32,
+}
+
+/// One request's standing at its origin's gate; hold it until the response body is read.
+#[cfg(feature = "stealth")]
+pub(crate) struct DialTicket {
+    gate: Arc<DialGate>,
+    scout: Option<tokio::sync::OwnedMutexGuard<()>>,
+    proven: bool,
+}
+
+#[cfg(feature = "stealth")]
+const SCOUT_WAIT: Duration = Duration::from_secs(2);
+
+#[cfg(feature = "stealth")]
+fn dial_gate(proxy_url: Option<&str>, url: &Url) -> Arc<DialGate> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<DialGate>>>> = std::sync::OnceLock::new();
+    let origin = format!("{}|{}://{}:{}", proxy_url.unwrap_or(""), url.scheme(), url.host_str().unwrap_or(""), url.port_or_known_default().unwrap_or(0));
+    GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(origin)
+        .or_insert_with(|| {
+            Arc::new(DialGate { scout: Arc::default(), proven: 0.into() })
+        })
+        .clone()
+}
+
+#[cfg(feature = "stealth")]
+impl DialGate {
+    pub(crate) async fn enter(self: &Arc<Self>) -> DialTicket {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut ticket = DialTicket { gate: self.clone(), scout: None, proven: false };
+        if self.proven.load(Relaxed) > 0 || std::env::var_os("OBSCURA_NO_DIAL_GATE").is_some() {
+            return ticket;
+        }
+        match self.scout.clone().try_lock_owned() {
+            Ok(guard) => ticket.scout = Some(guard),
+            Err(_) => {
+                let _ = tokio::time::timeout(SCOUT_WAIT, self.scout.lock()).await;
+            }
+        }
+        ticket
+    }
+}
+
+#[cfg(feature = "stealth")]
+impl DialTicket {
+    /// The response headers arrived, so the origin has a connection: let the waiting requests go.
+    pub(crate) fn settle(&mut self) {
+        if !self.proven {
+            self.proven = true;
+            self.gate.proven.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.scout = None;
+    }
+}
+
+#[cfg(feature = "stealth")]
+impl Drop for DialTicket {
+    fn drop(&mut self) {
+        if self.proven {
+            self.gate.proven.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     /// The client and the AIA cache generation it was built at.
@@ -246,13 +345,7 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         allow_private_network: bool,
     ) -> Self {
-        let generation = crate::aia::generation();
-        let client = Self::build_client(
-            proxy_url,
-            allow_private_network,
-            &crate::aia::cached_certificates(),
-            false,
-        );
+        let (client, generation) = Self::shared_client(proxy_url, allow_private_network);
 
         StealthHttpClient {
             client: std::sync::RwLock::new((client, generation)),
@@ -265,6 +358,22 @@ impl StealthHttpClient {
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// The process-wide client for these transport settings, built on first use. Every page, iframe and CDP
+    /// connection in the process shares its connection pool and TLS session cache, so one origin costs one
+    /// HTTP/2 connection per process instead of one per page. wreq keeps no cookies (the jar lives in
+    /// `StealthHttpClient`) and no per-request state, so sharing it leaks nothing between contexts.
+    fn shared_client(proxy_url: Option<&str>, allow_private_network: bool) -> (wreq::Client, u64) {
+        let mut clients = SHARED_CLIENTS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+        clients
+            .entry(client_key(proxy_url, allow_private_network))
+            .or_insert_with(|| {
+                let generation = crate::aia::generation();
+                let client = Self::build_client(proxy_url, allow_private_network, &crate::aia::cached_certificates(), false);
+                (client, generation)
+            })
+            .clone()
     }
 
     /// Build the Chrome-emulating client. `intermediates` are AIA-fetched
@@ -379,6 +488,12 @@ impl StealthHttpClient {
             &crate::aia::cached_certificates(),
             false,
         );
+        // Publish it so pages created later start with the intermediates too.
+        SHARED_CLIENTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(client_key(self.proxy_url.as_deref(), self.allow_private_network), (client.clone(), generation));
         *self.client.write().unwrap_or_else(|p| p.into_inner()) = (client, generation);
     }
 
@@ -449,13 +564,20 @@ impl StealthHttpClient {
         request: wreq::RequestBuilder,
         url: &Url,
         reset_retry: bool,
-    ) -> Result<wreq::Response, wreq::Error> {
-        let send_once = |client: wreq::Client, request: wreq::Request| async move {
-            let builder = wreq::RequestBuilder::from_parts(client, request);
-            if reset_retry {
-                send_get_with_connection_reset_retry(builder, url).await
-            } else {
-                builder.send().await
+    ) -> Result<(wreq::Response, DialTicket), wreq::Error> {
+        let gate = dial_gate(self.proxy_url.as_deref(), url);
+        let send_once = |client: wreq::Client, request: wreq::Request| {
+            let gate = gate.clone();
+            async move {
+                let mut ticket = gate.enter().await;
+                let builder = wreq::RequestBuilder::from_parts(client, request);
+                let response = if reset_retry {
+                    send_get_with_connection_reset_retry(builder, url).await
+                } else {
+                    builder.send().await
+                }?;
+                ticket.settle();
+                Ok::<_, wreq::Error>((response, ticket))
             }
         };
         let (mut client, request) = request.build_split();
@@ -500,7 +622,94 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_profile(url, request, callbacks).await
+        // Fleet-wide asset cache (feature `redis-cache`): a hit costs no connection to the origin or its CDN.
+        #[cfg(feature = "redis-cache")]
+        let shared = self.shared_cache_slot(url, &request).await;
+        #[cfg(feature = "redis-cache")]
+        if let Some((cache, key)) = &shared {
+            if let Some(entry) = cache.lookup(key).await {
+                if crate::shared_cache::shared_entry_remaining(&entry).is_some() {
+                    let response = Response {
+                        url: url.clone(),
+                        status: entry.status,
+                        headers: entry.headers.into_iter().collect(),
+                        body: entry.body,
+                        redirected_from: Vec::new(),
+                    };
+                    let origin = serialized_request_origin(&request, false);
+                    let cors_ok = validate_cors_response(
+                        &request,
+                        url,
+                        &origin,
+                        response.header("access-control-allow-origin"),
+                        response.header("access-control-allow-credentials"),
+                    )
+                    .is_ok();
+                    if cors_ok && response.body.len() <= request.max_response_bytes {
+                        if let Some(callbacks) = callbacks {
+                            let info = RequestInfo {
+                                url: url.clone(),
+                                method: "GET".to_string(),
+                                headers: self.extra_headers.read().await.clone(),
+                                resource_type: request.resource_type,
+                            };
+                            callbacks.fire_request(&info).await;
+                            callbacks.fire_response(&info, &response).await;
+                        }
+                        tracing::debug!("Shared asset cache hit, connection spared: {url}");
+                        return Ok(response);
+                    }
+                }
+            }
+        }
+        let result = self.fetch_with_profile(url, request, callbacks).await;
+        #[cfg(feature = "redis-cache")]
+        if let (Some((cache, key)), Ok(response)) = (shared, &result) {
+            if response.body.len() <= cache.max_body_bytes() {
+                if let Some(entry) = crate::shared_cache::shared_entry_for(response) {
+                    cache.store(key, entry);
+                }
+            }
+        }
+        result
+    }
+
+    /// The shared-cache key for `request`, when it may be shared: a plain static asset fetched without
+    /// credentials, cookies or caller headers that could make the response personal.
+    #[cfg(feature = "redis-cache")]
+    async fn shared_cache_slot(
+        &self,
+        url: &Url,
+        request: &ResourceRequest,
+    ) -> Option<(&'static crate::shared_cache::SharedAssetCache, String)> {
+        use crate::client::ResourceType;
+        if !matches!(url.scheme(), "http" | "https")
+            || !matches!(
+                request.resource_type,
+                ResourceType::Script | ResourceType::Stylesheet | ResourceType::Image | ResourceType::Font
+            )
+            || is_tracker_blocked(url, self.block_trackers)
+        {
+            return None;
+        }
+        if self.extra_headers.read().await.keys().any(|name| {
+            ["authorization", "cookie", "cache-control"].iter().any(|h| name.eq_ignore_ascii_case(h))
+        }) {
+            return None;
+        }
+        if request.sends_credentials_to(url)
+            && !self.cookie_jar.get_cookie_header_in_context(url, SameSiteContext::SameSite).is_empty()
+        {
+            return None;
+        }
+        let cache = crate::shared_cache::shared_asset_cache().await?;
+        let key = crate::shared_cache::shared_cache_key(
+            url.as_str(),
+            STEALTH_USER_AGENT,
+            &format!("{:?}", request.resource_type),
+            &format!("{:?}", request.credentials),
+        );
+        Some((cache, key))
     }
 
     async fn fetch_with_profile(
@@ -593,7 +802,7 @@ impl StealthHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = self
+            let (resp, _dial) = self
                 .send_with_aia(req, &current_url, true)
                 .await
                 .map_err(|e| {
@@ -748,7 +957,7 @@ impl StealthHttpClient {
         }
 
         let in_flight = InFlightGuard::new(&self.in_flight);
-        let resp = self.send_with_aia(req, url, false).await.map_err(|e| {
+        let (resp, dial) = self.send_with_aia(req, url, false).await.map_err(|e| {
             ObscuraNetError::Network(format!("{}: {}", url, error_chain(&e)))
         })?;
 
@@ -770,7 +979,7 @@ impl StealthHttpClient {
             status: status.as_u16(),
             headers: response_headers,
             body: Box::pin(async move {
-                let _in_flight = in_flight;
+                let (_in_flight, _dial) = (in_flight, dial);
                 read_wreq_body_limited(resp, &body_url, max_body_bytes).await
             }),
         })
@@ -1131,5 +1340,56 @@ mod tests {
             .await
             .expect("loopback hostname must be reachable with the opt-in");
         assert_eq!(resp.status, 200);
+    }
+
+    // The first request to an origin with no live connection dials alone; the rest wait for its headers, then run.
+    #[tokio::test]
+    async fn dial_gate_lets_one_request_dial_and_releases_the_rest_on_its_headers() {
+        let url = Url::parse("https://dial-gate-test.invalid/").unwrap();
+        let gate = super::dial_gate(None, &url);
+        let mut scout = gate.enter().await;
+        assert!(scout.scout.is_some(), "the first request must be the scout");
+
+        let waiting = gate.clone();
+        let waiter = tokio::spawn(async move { waiting.enter().await.scout.is_none() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "a second request must wait for the scout");
+
+        scout.settle();
+        assert!(waiter.await.unwrap(), "the waiter proceeds without dialing alone");
+        assert!(gate.enter().await.scout.is_none(), "an origin with a running request is not gated");
+
+        drop(scout);
+        assert!(gate.enter().await.scout.is_some(), "an origin with no running request is gated again");
+    }
+
+    // Pages in one process share the wreq client, so a second page reuses the first page's connection.
+    #[tokio::test]
+    async fn pages_share_one_connection_pool() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0
+                            || stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        for _ in 0..2 {
+            let page = StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+            assert_eq!(page.fetch(&url).await.expect("fixture must be reachable").status, 200);
+        }
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1, "both pages must reuse one connection");
     }
 }
