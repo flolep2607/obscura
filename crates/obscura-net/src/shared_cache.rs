@@ -477,4 +477,52 @@ mod redis_tests {
         let ttl: i64 = redis::cmd("TTL").arg(&keys[0]).query_async(&mut conn).await.unwrap();
         assert!(ttl > 3000, "TTL should track max-age, got {ttl}");
     }
+
+    // The stealth transport has no in-process cache, so its second fetch of a public asset must come from Redis.
+    #[cfg(feature = "stealth")]
+    #[tokio::test]
+    async fn stealth_fetch_is_served_from_the_shared_cache() {
+        let Some(url) = std::env::var("OBSCURA_REDIS_TEST_URL").ok() else {
+            eprintln!("skipping: OBSCURA_REDIS_TEST_URL not set");
+            return;
+        };
+        // Database 2 of the same server: the plain client's test above flushes and counts keys in the one the URL names.
+        let url = format!("{}/2", url.rsplit_once('/').map_or(url.as_str(), |(server, _)| server));
+        std::env::set_var("OBSCURA_SHARED_ASSET_CACHE_URL", &url);
+        {
+            let client = redis::Client::open(url.as_str()).unwrap();
+            let mut conn = client.get_connection_manager().await.unwrap();
+            redis::cmd("FLUSHDB").query_async::<()>(&mut conn).await.unwrap();
+        }
+        let body = "let stealth = 'shared';";
+        let wire_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nCache-Control: public, max-age=3600\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut scratch = [0u8; 2048];
+                let _ = stream.read(&mut scratch).await;
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(wire_response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        let target = Url::parse(&format!("http://{address}/lib.js")).unwrap();
+        let initiator = target.join("/page.html").unwrap();
+        let client = crate::wreq_client::StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+        let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
+
+        let first = client.fetch_resource_with_callbacks(&target, request.clone(), None).await.unwrap();
+        assert_eq!(first.body, body.as_bytes());
+        tokio::time::sleep(Duration::from_millis(300)).await; // the write-back is fire-and-forget
+        let second = client.fetch_resource_with_callbacks(&target, request, None).await.unwrap();
+        assert_eq!(second.body, body.as_bytes());
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1, "the second fetch must come from Redis");
+    }
 }
