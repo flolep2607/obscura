@@ -70,8 +70,9 @@ struct Args {
 
     /// Pass raw flags to V8, in the same form V8/Chromium/Node accept
     /// (e.g. `"--max-old-space-size=4096 --max-semi-space-size=64 --expose-gc"`).
-    /// Applied once at startup before any isolate is created.
-    #[arg(long, value_name = "FLAGS", allow_hyphen_values = true)]
+    /// Applied once at startup before any isolate is created, and passed on
+    /// to `serve --workers` processes.
+    #[arg(long, global = true, value_name = "FLAGS", allow_hyphen_values = true)]
     v8_flags: Option<String>,
 }
 
@@ -561,6 +562,7 @@ async fn run_cli() -> anyhow::Result<()> {
                     max_connections,
                     policy,
                     Duration::from_secs(worker_drain_timeout),
+                    args.v8_flags.clone(),
                 )
                 .await?;
             } else {
@@ -899,6 +901,7 @@ async fn run_multi_worker_serve(
     max_connections: usize,
     policy: pool::RecyclePolicy,
     drain_timeout: Duration,
+    v8_flags: Option<String>,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -948,6 +951,9 @@ async fn run_multi_worker_serve(
         }
         if stealth {
             cmd.arg("--stealth");
+        }
+        if let Some(ref flags) = v8_flags {
+            cmd.arg(format!("--v8-flags={flags}"));
         }
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::inherit());
@@ -2872,6 +2878,14 @@ mod tests {
         ])
         .expect("clap should accept --v8-flags with serve");
         assert_eq!(args.v8_flags.as_deref(), Some("--max-old-space-size=2048"));
+    }
+
+    // Launchers append their options after the subcommand.
+    #[test]
+    fn parsed_v8_flags_after_serve_subcommand() {
+        let args = Args::try_parse_from(["obscura", "serve", "--port", "9333", "--v8-flags=--max-old-space-size=1024"])
+            .expect("clap should accept --v8-flags after serve");
+        assert_eq!(args.v8_flags.as_deref(), Some("--max-old-space-size=1024"));
     }
 
     #[test]
