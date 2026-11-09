@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use deno_core::Extension;
@@ -168,16 +169,16 @@ const LOCAL_STORAGE_ORIGIN_LIMIT: usize = 5 * 1024 * 1024;
 const LOCAL_STORAGE_TOTAL_LIMIT: usize = 32 * 1024 * 1024;
 const LOCAL_STORAGE_ORIGIN_COUNT_LIMIT: usize = 256;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct OriginStorageEntries {
-    items: Vec<(String, String)>,
+    items: Vec<Arc<(String, String)>>,
     indices: HashMap<String, usize>,
     bytes: usize,
 }
 
 #[derive(Default)]
 struct OriginStorageInner {
-    origins: HashMap<String, OriginStorageEntries>,
+    origins: HashMap<String, Arc<OriginStorageEntries>>,
     bytes: usize,
     changed: HashSet<String>,
 }
@@ -192,14 +193,27 @@ impl OriginStorage {
         self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Independent store; each origin stays shared until its first mutation.
+    pub fn isolated_snapshot(&self) -> Self {
+        let inner = self.lock();
+        Self {
+            inner: std::sync::Mutex::new(OriginStorageInner {
+                origins: inner.origins.clone(),
+                bytes: inner.bytes,
+                changed: HashSet::new(),
+            }),
+        }
+    }
+
     pub fn snapshot(&self, origin: &str) -> Vec<(String, String)> {
-        self.lock().origins.get(origin).map(|entries| entries.items.clone()).unwrap_or_default()
+        self.lock().origins.get(origin).map(|entries|
+            entries.items.iter().map(|entry| entry.as_ref().clone()).collect()).unwrap_or_default()
     }
 
     pub fn get(&self, origin: &str, key: &str) -> Option<String> {
         self.lock().origins.get(origin)
             .and_then(|entries| entries.indices.get(key).and_then(|index| entries.items.get(*index)))
-            .map(|(_, value)| value.clone())
+            .map(|entry| entry.1.clone())
     }
 
     pub fn len(&self, origin: &str) -> usize {
@@ -208,7 +222,7 @@ impl OriginStorage {
 
     pub fn key(&self, origin: &str, index: usize) -> Option<String> {
         self.lock().origins.get(origin).and_then(|entries| entries.items.get(index))
-            .map(|(key, _)| key.clone())
+            .map(|entry| entry.0.clone())
     }
 
     /// Refuse writes over budget without changing the previous value.
@@ -219,8 +233,8 @@ impl OriginStorage {
         let entries = inner.origins.get(origin);
         let index = entries.and_then(|entries| entries.indices.get(&key).copied());
         let previous = entries.and_then(|entries| index.and_then(|index| entries.items.get(index)));
-        if previous.is_some_and(|(_, previous)| previous == &value) { return true; }
-        let previous_bytes = previous.map_or(0, |(name, value)| name.len() + value.len());
+        if previous.is_some_and(|previous| previous.1 == value) { return true; }
+        let previous_bytes = previous.map_or(0, |entry| entry.0.len() + entry.1.len());
         let origin_bytes = entries.map_or(0, |entries| entries.bytes);
         let new_bytes = key.len() + value.len();
         let next_origin_bytes = origin_bytes.saturating_sub(previous_bytes) + new_bytes;
@@ -228,12 +242,12 @@ impl OriginStorage {
         if next_origin_bytes > LOCAL_STORAGE_ORIGIN_LIMIT || next_total_bytes > LOCAL_STORAGE_TOTAL_LIMIT {
             return false;
         }
-        let entries = inner.origins.entry(origin.to_string()).or_default();
+        let entries = Arc::make_mut(inner.origins.entry(origin.to_string()).or_default());
         if let Some(index) = index {
-            entries.items[index].1 = value;
+            entries.items[index] = Arc::new((key, value));
         } else {
             entries.indices.insert(key.clone(), entries.items.len());
-            entries.items.push((key, value));
+            entries.items.push(Arc::new((key, value)));
         }
         entries.bytes = next_origin_bytes;
         inner.bytes = next_total_bytes;
@@ -244,17 +258,18 @@ impl OriginStorage {
     pub fn remove(&self, origin: &str, key: &str) {
         let mut inner = self.lock();
         let removed = inner.origins.get_mut(origin).and_then(|entries| {
-            entries.indices.remove(key).map(|index| {
-                let removed = entries.items.remove(index);
-                entries.bytes -= removed.0.len() + removed.1.len();
-                for (index, (name, _)) in entries.items.iter().enumerate().skip(index) {
-                    if let Some(position) = entries.indices.get_mut(name) { *position = index; }
-                }
-                removed
-            })
+            let index = entries.indices.get(key).copied()?;
+            let entries = Arc::make_mut(entries);
+            entries.indices.remove(key);
+            let removed = entries.items.remove(index);
+            entries.bytes -= removed.0.len() + removed.1.len();
+            for (index, entry) in entries.items.iter().enumerate().skip(index) {
+                if let Some(position) = entries.indices.get_mut(&entry.0) { *position = index; }
+            }
+            Some(removed)
         });
-        if let Some((name, value)) = removed {
-            inner.bytes -= name.len() + value.len();
+        if let Some(removed) = removed {
+            inner.bytes -= removed.0.len() + removed.1.len();
             if inner.origins.get(origin).is_some_and(|entries| entries.items.is_empty()) { inner.origins.remove(origin); }
             inner.changed.insert(origin.to_string());
         }
@@ -263,7 +278,8 @@ impl OriginStorage {
     pub fn entries(&self) -> Vec<(String, Vec<(String, String)>)> {
         let inner = self.lock();
         let mut out: Vec<_> = inner.origins.iter()
-            .map(|(origin, entries)| (origin.clone(), entries.items.clone())).collect();
+            .map(|(origin, entries)| (origin.clone(),
+                entries.items.iter().map(|entry| entry.as_ref().clone()).collect())).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
@@ -284,7 +300,10 @@ impl OriginStorage {
         let next_bytes = inner.bytes.saturating_sub(previous_bytes).saturating_add(bytes);
         if next_bytes > LOCAL_STORAGE_TOTAL_LIMIT { return false; }
         if items.is_empty() { inner.origins.remove(origin); }
-        else { inner.origins.insert(origin.to_string(), OriginStorageEntries { items, indices, bytes }); }
+        else {
+            let items = items.into_iter().map(Arc::new).collect();
+            inner.origins.insert(origin.to_string(), Arc::new(OriginStorageEntries { items, indices, bytes }));
+        }
         inner.bytes = next_bytes;
         inner.changed.remove(origin);
         true
@@ -296,13 +315,48 @@ impl OriginStorage {
         origins
     }
 
+    /// Merge changed keys without replacing another connection's untouched values.
+    /// A false result means at least one changed value exceeded the destination budget.
+    pub fn merge_changes(&self, initial: &Self, current: &Self) -> bool {
+        let changed = {
+            let current = current.lock();
+            let mut changed: Vec<_> = current.changed.iter()
+                .map(|origin| (origin.clone(), current.origins.get(origin).cloned())).collect();
+            changed.sort_by(|a, b| a.0.cmp(&b.0));
+            changed
+        };
+        let mut accepted = true;
+        for (origin, current) in changed {
+            let initial = initial.lock().origins.get(&origin).cloned();
+            if let Some(initial) = &initial {
+                for entry in &initial.items {
+                    if !current.as_ref().is_some_and(|entries| entries.indices.contains_key(&entry.0)) {
+                        self.remove(&origin, &entry.0);
+                    }
+                }
+            }
+            if let Some(current) = current {
+                for entry in &current.items {
+                    let previous = initial.as_ref().and_then(|entries|
+                        entries.indices.get(&entry.0).and_then(|index| entries.items.get(*index)));
+                    if previous.is_some_and(|previous|
+                        Arc::ptr_eq(previous, entry) || previous.1 == entry.1) { continue; }
+                    if !self.set(&origin, entry.0.clone(), entry.1.clone()) { accepted = false; }
+                }
+            }
+        }
+        accepted
+    }
+
     /// One lock fences mutations and competing writers through acknowledgement.
     pub fn flush_changed(&self, mut write: impl FnMut(&str, &[(String, String)]) -> bool) {
         let mut inner = self.lock();
         let mut origins: Vec<_> = inner.changed.iter().cloned().collect();
         origins.sort();
         for origin in origins {
-            if write(&origin, inner.origins.get(&origin).map_or(&[], |entries| entries.items.as_slice())) {
+            let entries: Vec<_> = inner.origins.get(&origin).map(|entries|
+                entries.items.iter().map(|entry| entry.as_ref().clone()).collect()).unwrap_or_default();
+            if write(&origin, &entries) {
                 inner.changed.remove(&origin);
             }
         }
@@ -326,8 +380,44 @@ struct StorageOriginCache {
     origin: String,
 }
 
+struct FormCacheBuffer {
+    generation: Arc<AtomicU64>,
+    backing_store: v8::SharedRef<v8::BackingStore>,
+    publisher: Arc<StdMutex<FormCachePublisher>>,
+    observer: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+struct FormCachePublisher {
+    backing_store: v8::SharedRef<v8::BackingStore>,
+    generation: std::sync::Weak<AtomicU64>,
+}
+
+impl FormCachePublisher {
+    fn publish(&self, generation: u64) {
+        let words = self.backing_store.data().expect("fixed form cache backing storage").cast::<u32>().as_ptr();
+        // The pinned eight-byte V8 allocation was checked for u32 alignment.
+        unsafe {
+            AtomicU32::from_ptr(words).store(generation as u32, AtomicOrdering::Relaxed);
+            AtomicU32::from_ptr(words.add(1)).store((generation >> 32) as u32, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
+fn form_cache_observer(
+    publisher: Arc<StdMutex<FormCachePublisher>>,
+    owner: std::sync::Weak<AtomicU64>,
+) -> Arc<dyn Fn(u64) + Send + Sync> {
+    Arc::new(move |generation| {
+        let publisher = publisher.lock().expect("form cache backing storage poisoned");
+        // A retired document can still be retained by native callers.
+        if !std::sync::Weak::ptr_eq(&owner, &publisher.generation) { return; }
+        publisher.publish(generation);
+    })
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
+    form_cache_buffer: Option<FormCacheBuffer>,
     pub url: String,
     /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
@@ -597,6 +687,32 @@ pub struct PendingFrameMessage {
 }
 
 impl ObscuraState {
+    pub(crate) fn replace_dom(&mut self, dom: DomTree) {
+        if let Some(cache) = self.form_cache_buffer.as_mut() {
+            let generation = dom.form_cache_generation_handle();
+            generation.store(cache.generation.load(AtomicOrdering::Relaxed).wrapping_add(1), AtomicOrdering::Relaxed);
+            cache.publisher.lock().expect("form cache backing storage poisoned").generation = Arc::downgrade(&generation);
+            let observer = form_cache_observer(cache.publisher.clone(), Arc::downgrade(&generation));
+            observer(generation.load(AtomicOrdering::Relaxed));
+            dom.watch_form_cache_generation(Arc::downgrade(&observer));
+            cache.observer = Some(observer);
+            cache.generation = generation;
+        }
+        self.dom = Some(dom);
+    }
+
+    pub(crate) fn take_dom(&mut self) -> Option<DomTree> {
+        let dom = self.dom.take()?;
+        if let Some(cache) = self.form_cache_buffer.as_mut() {
+            let mut publisher = cache.publisher.lock().expect("form cache backing storage poisoned");
+            publisher.generation = std::sync::Weak::new();
+            let epoch = cache.generation.fetch_add(1, AtomicOrdering::Relaxed).wrapping_add(1);
+            publisher.publish(epoch);
+            cache.observer = None;
+        }
+        Some(dom)
+    }
+
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
         self.media_preferences = parent.media_preferences.clone();
         #[cfg(feature = "render")]
@@ -632,6 +748,7 @@ impl ObscuraState {
         let (render_resource_tx, render_resource_rx) = tokio::sync::mpsc::unbounded_channel();
         ObscuraState {
             dom: None,
+            form_cache_buffer: None,
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
@@ -1116,6 +1233,7 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
+    pub(crate) frame_preload_scripts: Vec<String>,
 }
 
 struct FrameTimers {
@@ -1240,6 +1358,16 @@ impl RealmStates {
             }
         }
         removed
+    }
+
+    pub(crate) fn has_pending_navigation(&self) -> bool {
+        self.entries.iter().any(|(_, _, state)| state.borrow().pending_navigation.is_some())
+    }
+
+    pub(crate) fn take_pending_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.entries.iter().filter_map(|(_, id, state)| {
+            state.borrow_mut().pending_navigation.take().map(|(url, method, body)| (*id, url, method, body))
+        }).collect()
     }
 
     pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
@@ -1884,13 +2012,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1907,8 +2040,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -2087,26 +2220,63 @@ fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] 
     [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
 }
 
+/// Tags with a per-tag HTML interface (HTMLDivElement and friends), in the
+/// order of `_HTML_INTERFACE_TAGS` in bootstrap.js.
+const HTML_INTERFACE_TAGS: &[&str] = &["a", "br", "body", "button", "datalist", "details", "dialog", "div",
+    "fieldset", "hr", "head", "h1", "h2", "h3", "h4", "h5", "h6", "html", "label", "legend", "link",
+    "p", "pre", "progress", "script", "span", "style", "template", "ul", "area", "base", "dl", "data",
+    "dir", "embed", "font", "frame", "frameset", "map", "marquee", "menu", "meter", "del", "ins",
+    "object", "optgroup", "output", "param", "picture", "blockquote", "q", "source", "select", "option",
+    "table", "caption", "td", "th", "col", "colgroup", "tr", "tbody", "thead", "tfoot", "time", "title"];
+
+fn html_interface_kind(local: &str) -> i32 {
+    HTML_INTERFACE_TAGS.iter().position(|tag| *tag == local).map_or(0, |i| 32 + i as i32)
+}
+
 /// Which JS wrapper class an element gets, as a small code. This is the
-/// native twin of `_classForKind` in bootstrap.js and replaces three string
-/// round trips (tag name, namespace, local name) per wrapped element.
+/// native twin of `_elementClassFor` in bootstrap.js and replaces string
+/// round trips per wrapped element.
 /// 0 Element, 1 SVGElement, 2 SVGPathElement, 3 SVGSVGElement, 4 form,
 /// 5 input, 6 textarea, 7 meta, 8 slot, 9 img, 10 canvas, 11 audio, 12 video,
-/// 13 track, 14 ol, 15 li, 16 iframe.
+/// 13 track, 14 ol, 15 li, 16 iframe, 32+ `HTML_INTERFACE_TAGS` index.
 fn element_class_kind(name: &html5ever::QualName) -> i32 {
     let html = name.ns == html5ever::ns!(html);
     let local = name.local.as_ref();
+    let lowercase = !local.bytes().any(|b| b.is_ascii_uppercase());
+    if html && name.prefix.is_some() {
+        // `_elementClassForKnownName` with the local name.
+        return match local {
+            "input" => 5,
+            "meta" => 7,
+            "ol" => 14,
+            "li" => 15,
+            _ => match local.to_ascii_uppercase().as_str() {
+                "FORM" => 4,
+                "TEXTAREA" => 6,
+                "SLOT" => 8,
+                "IFRAME" => 16,
+                "IMG" => 9,
+                "CANVAS" => 10,
+                "AUDIO" => 11,
+                "VIDEO" => 12,
+                "TRACK" => 13,
+                _ if lowercase => html_interface_kind(local),
+                _ => 0,
+            },
+        };
+    }
+    let canonical = html && lowercase;
     // The same tagName JS would see: uppercase in the HTML namespace,
     // qualified and case-preserved elsewhere.
     let tag = if html {
-        local.to_uppercase()
+        local.to_ascii_uppercase()
     } else {
         match &name.prefix {
             Some(prefix) => format!("{}:{}", prefix, local),
             None => local.to_string(),
         }
     };
-    if tag != tag.to_uppercase() && name.ns.as_ref() == "http://www.w3.org/2000/svg" {
+    if !canonical && tag != tag.to_ascii_uppercase() && name.ns.as_ref() == "http://www.w3.org/2000/svg" {
         return match tag.as_str() {
             "path" => 2,
             "svg" => 3,
@@ -2118,15 +2288,16 @@ fn element_class_kind(name: &html5ever::QualName) -> i32 {
         "INPUT" if html && local == "input" => 5,
         "TEXTAREA" => 6,
         "META" if html && local == "meta" => 7,
+        "OL" if html && local == "ol" => 14,
+        "LI" if html && local == "li" => 15,
         "SLOT" if html => 8,
+        "IFRAME" if html => 16,
         "IMG" => 9,
         "CANVAS" => 10,
         "AUDIO" => 11,
         "VIDEO" => 12,
         "TRACK" => 13,
-        "OL" if html => 14,
-        "LI" if html => 15,
-        "IFRAME" if html => 16,
+        _ if canonical => html_interface_kind(local),
         _ => 0,
     }
 }
@@ -2193,7 +2364,10 @@ fn node_text(dom: &DomTree, code: u32, nid: u32) -> String {
             .with_node(id, |n| {
                 n.as_element().map(|name| {
                     if name.ns == html5ever::ns!(html) {
-                        name.local.as_ref().to_ascii_uppercase()
+                        match &name.prefix {
+                            Some(prefix) => format!("{}:{}", prefix, name.local).to_ascii_uppercase(),
+                            None => name.local.as_ref().to_ascii_uppercase(),
+                        }
                     } else {
                         match &name.prefix {
                             Some(prefix) => format!("{}:{}", prefix, name.local),
@@ -2258,6 +2432,61 @@ fn op_dom_attr(
             .flatten()
     }))
     .unwrap_or(None)
+}
+
+#[op2(fast)]
+fn op_form_owner(state: &OpState, nid: u32, frame_id: u32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        frame_state(state, frame_id).borrow().dom.as_ref()
+            .and_then(|dom| dom.form_owner(NodeId::new(nid)))
+            .map_or(-1, |form| form.raw() as i32)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_form_owner panicked; returning null");
+        -1
+    })
+}
+
+#[op2]
+fn op_form_cache_buffer<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>, state: &OpState, frame_id: u32,
+) -> v8::Local<'s, v8::Value> {
+    let backing_store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut state = shared.borrow_mut();
+        let dom = state.dom.as_ref()?;
+        let generation = dom.form_cache_generation_handle();
+        if let Some(cache) = state.form_cache_buffer.as_ref() {
+            if Arc::ptr_eq(&cache.generation, &generation) {
+                return Some(cache.backing_store.clone());
+            }
+        }
+        let backing_store = v8::SharedArrayBuffer::new_backing_store(scope, 8).make_shared();
+        let Some(data) = backing_store.data() else {
+            tracing::error!("form cache backing storage is empty");
+            return None;
+        };
+        if !data.cast::<AtomicU32>().as_ptr().is_aligned() {
+            tracing::error!("form cache backing storage is not aligned for shared uint32 words");
+            return None;
+        }
+        let publisher = Arc::new(StdMutex::new(FormCachePublisher {
+            backing_store: backing_store.clone(), generation: Arc::downgrade(&generation),
+        }));
+        let observer = form_cache_observer(publisher.clone(), Arc::downgrade(&generation));
+        observer(generation.load(AtomicOrdering::Relaxed));
+        dom.watch_form_cache_generation(Arc::downgrade(&observer));
+        state.form_cache_buffer = Some(FormCacheBuffer {
+            generation, backing_store: backing_store.clone(), publisher, observer: Some(observer),
+        });
+        Some(backing_store)
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_form_cache_buffer panicked; rejecting cache");
+        None
+    });
+    match backing_store {
+        Some(store) => v8::SharedArrayBuffer::with_backing_store(scope, &store).into(),
+        None => v8::null(scope).into(),
+    }
 }
 
 #[op2]
@@ -3002,9 +3231,96 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 None => "null".into(),
             }
         }
+        "form_owner" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.form_owner(nid).map(|form| form.index())).to_string()
+        }
+        "form_controls" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.form_controls(nid).map(|controls| {
+                controls.into_iter().map(|control| control.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_rows" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.table_rows(nid).map(|rows| {
+                rows.into_iter().map(|row| row.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_interface" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.table_interface(nid)).to_string()
+        }
+        "table_head" | "table_foot" | "table_bodies" | "table_section_rows" | "table_row_cells" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let elements = match cmd.as_str() {
+                "table_head" => dom.table_sections(nid, "thead"),
+                "table_foot" => dom.table_sections(nid, "tfoot"),
+                "table_bodies" => dom.table_sections(nid, "tbody"),
+                "table_section_rows" => dom.table_section_rows(nid),
+                _ => dom.table_row_cells(nid),
+            };
+            serde_json::json!(elements.map(|elements| {
+                elements.into_iter().map(|element| element.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "table_row_index" | "table_section_row_index" | "table_cell_index" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let index = match cmd.as_str() {
+                "table_row_index" => dom.table_row_index(nid, false),
+                "table_section_row_index" => dom.table_row_index(nid, true),
+                _ => dom.table_cell_index(nid),
+            };
+            serde_json::json!(index).to_string()
+        }
+        "select_options" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.select_options(nid).map(|options| {
+                options.into_iter().map(|option| option.index()).collect::<Vec<_>>()
+            })).to_string()
+        }
+        "option_index" => {
+            let nid = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            serde_json::json!(dom.option_index(nid)).to_string()
+        }
         "tag_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
-            serde_json::to_string(&node_text(dom, 0, nid)).unwrap_or("\"\"".into())
+            dom
+                .with_node(NodeId::new(nid), |n| {
+                    n.as_element().map(|name| {
+                        let html = name.ns == html5ever::ns!(html);
+                        let tag = if html {
+                            match &name.prefix {
+                                Some(prefix) => {
+                                    let mut qualified = format!("{}:{}", prefix, name.local);
+                                    qualified.make_ascii_uppercase();
+                                    qualified
+                                }
+                                None => name.local.as_ref().to_ascii_uppercase(),
+                            }
+                        } else {
+                            match &name.prefix {
+                                Some(prefix) => format!("{}:{}", prefix, name.local),
+                                None => name.local.to_string(),
+                            }
+                        };
+                        if arg2 == "interface" && (!html || name.prefix.is_some()
+                            || name.local.as_ref().bytes().any(|byte| byte.is_ascii_uppercase())) {
+                            serde_json::json!([tag, name.ns.as_ref(), name.local.as_ref()]).to_string()
+                        } else {
+                            serde_json::Value::String(tag).to_string()
+                        }
+                    })
+                })
+                .flatten()
+                .unwrap_or_else(|| "\"\"".into())
+        }
+        "prefix" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let prefix = dom.with_node(NodeId::new(nid), |n| {
+                n.as_element().and_then(|name| name.prefix.as_ref().map(|prefix| prefix.to_string()))
+            }).flatten();
+            serde_json::to_string(&prefix).unwrap_or("null".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -5303,6 +5619,57 @@ mod tests {
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
     #[test]
+    fn origin_storage_snapshot_preserves_quota_and_profile_replacement_is_private() {
+        use std::sync::Arc;
+        let origin = "https://a.test";
+        let original = OriginStorage::default();
+        assert!(original.load(origin, vec![("k".into(), "x".repeat(LOCAL_STORAGE_ORIGIN_LIMIT - 1))]));
+        let copy = original.isolated_snapshot();
+        let shared = original.lock().origins[origin].clone();
+        assert!(!copy.set(origin, "extra".into(), String::new()));
+        assert!(Arc::ptr_eq(&shared, &copy.lock().origins[origin]));
+        assert!(copy.changed_origins().is_empty());
+        original.clear(origin);
+        assert_eq!(copy.len(origin), 1);
+        assert!(copy.load(origin, vec![("replacement".into(), "value".into())]));
+        assert_eq!(original.len(origin), 0);
+        assert_eq!(copy.snapshot(origin), vec![("replacement".into(), "value".into())]);
+        assert_eq!(copy.lock().bytes, "replacement".len() + "value".len());
+        copy.remove(origin, "replacement");
+        assert_eq!(copy.lock().bytes, 0);
+        assert_eq!(copy.changed_origins(), [origin]);
+    }
+
+    #[test]
+    fn origin_storage_snapshots_share_untouched_origins_but_not_mutations() {
+        use std::sync::Arc;
+        let original = OriginStorage::default();
+        assert!(original.load("https://a.test", vec![("seed".into(), "initial".into())]));
+        assert!(original.load("https://b.test", vec![("other".into(), "value".into())]));
+        let copy = original.isolated_snapshot();
+        let original_a = original.lock().origins["https://a.test"].clone();
+        let original_b = original.lock().origins["https://b.test"].clone();
+        assert!(Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(copy.changed_origins().is_empty());
+        copy.remove("https://a.test", "missing");
+        assert!(copy.set("https://a.test", "seed".into(), "initial".into()));
+        assert!(Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(copy.set("https://a.test", "new".into(), "value".into()));
+        assert!(!Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(Arc::ptr_eq(&original_a.items[0], &copy.lock().origins["https://a.test"].items[0]));
+        assert!(copy.set("https://a.test", "seed".into(), "changed".into()));
+        assert!(!Arc::ptr_eq(&original_a, &copy.lock().origins["https://a.test"]));
+        assert!(!Arc::ptr_eq(&original_a.items[0], &copy.lock().origins["https://a.test"].items[0]));
+        assert!(Arc::ptr_eq(&original_b, &copy.lock().origins["https://b.test"]));
+        assert_eq!(original.get("https://a.test", "seed").as_deref(), Some("initial"));
+        assert_eq!(copy.get("https://a.test", "seed").as_deref(), Some("changed"));
+        copy.clear("https://b.test");
+        assert_eq!(original.get("https://b.test", "other").as_deref(), Some("value"));
+        assert_eq!(copy.get("https://b.test", "other"), None);
+        assert_eq!(copy.changed_origins(), ["https://a.test", "https://b.test"]);
+    }
+
+    #[test]
     fn origin_storage_deletion_reinsertion_and_profile_replacement_keep_keys_and_quota_consistent() {
         let store = OriginStorage::default();
         let origin = "https://app.test";
@@ -5579,7 +5946,8 @@ mod tests {
 
     use super::read_body_capped;
     use super::url_set_inner;
-    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_derive, push_capped};
+    use super::{PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES, pbkdf2_blocks, pbkdf2_can_inline, pbkdf2_derive,
+        pbkdf2_derive_with, validate_pbkdf2, CancelPbkdf2OnDrop, push_capped};
     use super::{intercept_fulfill_response, visible_response_headers};
     use base64::{Engine as _, engine::general_purpose::STANDARD as FULFILL_BASE64};
 
@@ -5864,6 +6232,76 @@ mod tests {
         let dk = pbkdf2_derive("SHA-256", b"password", b"salt", 1_000, 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(dk.len(), 32, "derived key must have the requested length");
+    }
+
+    #[test]
+    fn pbkdf2_bounds_the_combined_work_before_deriving() {
+        let error = validate_pbkdf2("SHA-1", PBKDF2_MAX_ITERATIONS, PBKDF2_MAX_OUTPUT_BYTES)
+            .expect_err("iteration and output caps alone must not permit unbounded work");
+        assert!(error.to_string().contains("work"), "{error}");
+        assert!(validate_pbkdf2("SHA-256", PBKDF2_MAX_ITERATIONS, 32).is_ok());
+        assert!(validate_pbkdf2("SHA-256", 0, 32).is_err());
+    }
+
+    #[test]
+    fn pbkdf2_native_fast_path_is_bounded_by_work_and_input_size() {
+        assert!(pbkdf2_can_inline(4096, 512, 512));
+        assert!(!pbkdf2_can_inline(4097, 8, 8));
+        assert!(!pbkdf2_can_inline(1, 512, 513));
+        assert!(!pbkdf2_can_inline(1, usize::MAX, 1));
+    }
+
+    #[test]
+    fn pbkdf2_cancelled_work_stops_even_with_few_or_no_output_blocks() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        for iterations in [1, 2, 4096, 4097, PBKDF2_MAX_ITERATIONS] {
+            for length in [0, 32, 65] {
+                let error = pbkdf2_derive_with(
+                    "SHA-256", b"password", b"salt", iterations, length, &cancelled,
+                ).expect_err("cancellation must be checked before every derivation");
+                assert!(error.to_string().contains("cancelled"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn pbkdf2_block_boundary_checks_cancellation_below_the_round_interval() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let mut output = [7; 65];
+        assert!(!pbkdf2_blocks::<hmac::Hmac<sha2::Sha256>>(
+            b"password", b"salt", 1, &mut output, &cancelled,
+        ));
+        assert_eq!(output, [7; 65], "cancelled work must not start its first block");
+    }
+
+    #[test]
+    fn pbkdf2_blocks_match_existing_primitives_and_rfc6070() {
+        let derived = pbkdf2_derive("SHA-1", b"password", b"salt", 4096, 20).unwrap();
+        let hex: String = derived.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "4b007901b765489abead49d926f721d065a429c1");
+        for (hash, length) in [("SHA-1", 45), ("SHA-256", 70), ("SHA-384", 49), ("SHA-512", 130)] {
+            for iterations in [1, 2, 5000] {
+                let derived = pbkdf2_derive(hash, b"password", b"salt", iterations, length).unwrap();
+                let mut expected = vec![0; length as usize];
+                match hash {
+                    "SHA-1" => pbkdf2::pbkdf2_hmac::<sha1::Sha1>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-256" => pbkdf2::pbkdf2_hmac::<sha2::Sha256>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-384" => pbkdf2::pbkdf2_hmac::<sha2::Sha384>(b"password", b"salt", iterations, &mut expected),
+                    "SHA-512" => pbkdf2::pbkdf2_hmac::<sha2::Sha512>(b"password", b"salt", iterations, &mut expected),
+                    _ => unreachable!(),
+                }
+                assert_eq!(derived, expected, "{hash}, iterations={iterations}, length={length}");
+            }
+        }
+    }
+
+    #[test]
+    fn dropping_a_pbkdf2_waiter_signals_cancellation() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelPbkdf2OnDrop(cancelled.clone());
+        assert!(!cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        drop(guard);
+        assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     // HKDF and the CSPRNG draw share the same DoS shape: both size an output
@@ -6866,12 +7304,17 @@ pub struct SessionHistory {
     pub current: usize,
 }
 
+fn navigation_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
+    state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow().by_frame_id(frame_id)
+}
+
 /// `"documentStart,current,length"` of the session history; length is 0 when
 /// this realm has none.
 #[op2]
 #[string]
 fn op_session_history(state: &OpState, frame_id: u32) -> String {
-    let gs = frame_state(state, frame_id);
+    let Some(gs) = navigation_state(state, frame_id) else { return "0,0,0".into(); };
     let gs = gs.borrow();
     let history = &gs.session_history;
     format!("{},{},{}", history.document_start, history.current, history.urls.len())
@@ -6881,7 +7324,7 @@ fn op_session_history(state: &OpState, frame_id: u32) -> String {
 /// false when the index is out of range.
 #[op2(fast)]
 fn op_history_traverse(state: &OpState, index: u32, frame_id: u32) -> bool {
-    let gs = frame_state(state, frame_id);
+    let Some(gs) = navigation_state(state, frame_id) else { return false; };
     let mut gs = gs.borrow_mut();
     let index = index as usize;
     let Some(url) = gs.session_history.urls.get(index).cloned() else {
@@ -6905,7 +7348,7 @@ fn op_navigate(
     #[string] body: &str,
     frame_id: u32,
 ) {
-    let gs = frame_state(state, frame_id);
+    let Some(gs) = navigation_state(state, frame_id) else { return; };
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
     // updated on commit via `set_url` once the navigation is actually performed.
@@ -7091,6 +7534,149 @@ fn op_register_document_realm(
 
 /// Resolve a borrowed document member from the receiver's creation realm, not
 /// its public prototype, which a membrane is allowed to replace.
+pub(crate) fn document_realm<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> Option<(u32, v8::Local<'s, v8::Object>)> {
+    let context = receiver.get_creation_context(scope)?;
+    let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+    let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
+    Some((owner, members))
+}
+
+fn select_index_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    object: v8::Local<'_, v8::Object>,
+    data: v8::Local<'_, v8::Value>,
+    field: u32,
+    args: &[v8::Local<'s, v8::Value>],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let data = v8::Local::new(scope, data);
+    let callback = v8::Local::<v8::Array>::try_from(data).ok()
+        .and_then(|values| values.get_index(scope, field))
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok());
+    let Some(callback) = callback else {
+        if let Some(message) = v8::String::new(scope, "Invalid native select") {
+            let error = v8::Exception::type_error(scope, message);
+            scope.throw_exception(error);
+        }
+        return None;
+    };
+    callback.call(scope, object.into(), args)
+}
+
+fn select_index_values<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    object: v8::Local<'_, v8::Object>,
+    data: v8::Local<'_, v8::Value>,
+) -> Option<v8::Local<'s, v8::Array>> {
+    let value = select_index_callback(scope, object, data, 0, &[])?;
+    if let Ok(values) = v8::Local::<v8::Array>::try_from(value) { return Some(values); }
+    if let Some(message) = v8::String::new(scope, "Invalid native select options") {
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
+    }
+    None
+}
+
+fn select_allocator(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    if args.is_construct_call() { return; }
+    if let Some(message) = v8::String::new(scope, "Illegal constructor") {
+        let error = v8::Exception::type_error(scope, message);
+        scope.throw_exception(error);
+    }
+}
+
+#[op2(reentrant)]
+fn op_create_select_allocator<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    prototype: v8::Local<'s, v8::Object>,
+    refresh: v8::Local<'s, v8::Function>,
+    setter: v8::Local<'s, v8::Function>,
+) -> Result<v8::Local<'s, v8::Function>, deno_error::JsErrorBox> {
+    let context = prototype.get_creation_context(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::type_error("Invalid select creation realm"))?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let key = v8::String::new(scope, "_nid")
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select node key"))?;
+    let data = v8::Array::new_with_elements(scope, &[refresh.into(), setter.into()]);
+    let constructor = v8::FunctionTemplate::builder(select_allocator).build(scope);
+    let template = constructor.instance_template(scope);
+    let empty_nid = v8::Integer::new(scope, 0);
+    template.set(key.into(), empty_nid.into());
+    template.set_indexed_property_handler(v8::IndexedPropertyHandlerConfiguration::new().data(data.into())
+        .getter(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Value>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            if index >= values.length() { return v8::Intercepted::kNo; }
+            if let Some(value) = values.get_index(scope, index) { rv.set(value); }
+            v8::Intercepted::kYes
+        })
+        .setter(|scope: &mut v8::PinScope, index: u32, value: v8::Local<v8::Value>,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<()>| {
+            let value = v8::Local::new(scope, value);
+            let index = v8::Integer::new_from_unsigned(scope, index);
+            if select_index_callback(scope, args.holder(), args.data(), 1, &[index.into(), value]).is_some() {
+                rv.set_bool(true);
+            }
+            v8::Intercepted::kYes
+        })
+        .query(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Integer>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            if index >= values.length() { return v8::Intercepted::kNo; }
+            rv.set_int32(0);
+            v8::Intercepted::kYes
+        })
+        .definer(|scope: &mut v8::PinScope, index: u32, descriptor: &v8::PropertyDescriptor,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<()>| {
+            if descriptor.has_get() || descriptor.has_set() {
+                rv.set_bool(true);
+                return v8::Intercepted::kYes;
+            }
+            let value = if descriptor.has_value() { descriptor.value() } else { v8::undefined(scope).into() };
+            let value = v8::Local::new(scope, value);
+            let index = v8::Integer::new_from_unsigned(scope, index);
+            if select_index_callback(scope, args.holder(), args.data(), 1, &[index.into(), value]).is_some() {
+                rv.set_bool(true);
+            }
+            v8::Intercepted::kYes
+        })
+        .deleter(|scope: &mut v8::PinScope, index: u32,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Boolean>| {
+            let Some(values) = select_index_values(scope, args.holder(), args.data()) else { return v8::Intercepted::kYes };
+            let allowed = index >= values.length();
+            if !allowed && args.should_throw_on_error() {
+                if let Some(message) = v8::String::new(scope, "Cannot delete a supported select index") {
+                    let error = v8::Exception::type_error(scope, message);
+                    scope.throw_exception(error);
+                }
+            }
+            rv.set_bool(allowed);
+            v8::Intercepted::kYes
+        })
+        .enumerator(|scope: &mut v8::PinScope,
+            args: v8::PropertyCallbackArguments, mut rv: v8::ReturnValue<v8::Array>| {
+            if let Some(values) = select_index_values(scope, args.holder(), args.data()) {
+                let keys: Vec<v8::Local<v8::Value>> = (0..values.length())
+                    .map(|index| v8::Integer::new_from_unsigned(scope, index).into()).collect();
+                rv.set(v8::Array::new_with_elements(scope, &keys));
+            }
+        }));
+    let constructor = constructor.get_function(scope)
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create native select constructor"))?;
+    let key = v8::String::new(scope, "prototype")
+        .ok_or_else(|| deno_error::JsErrorBox::generic("Could not create select prototype key"))?;
+    if constructor.set(scope, key.into(), prototype.into()) != Some(true) {
+        return Err(deno_error::JsErrorBox::generic("Could not initialize native select prototype"));
+    }
+    Ok(constructor)
+}
+
 #[op2]
 fn op_document_realm_member<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
@@ -7099,10 +7685,8 @@ fn op_document_realm_member<'s, 'i>(
     caller_frame_id: u32,
 ) -> v8::Local<'s, v8::Value> {
     let member = (|| {
-        let context = receiver.get_creation_context(scope)?;
-        let owner = context.get_embedder_data(scope, DOCUMENT_OWNER_SLOT)?.uint32_value(scope)?;
+        let (owner, members) = document_realm(scope, receiver)?;
         if owner == caller_frame_id { return None; }
-        let members = context.get_embedder_data(scope, DOCUMENT_MEMBERS_SLOT)?.to_object(scope)?;
         let key = v8::String::new(scope, name)?;
         let value = members.get(scope, key.into())?;
         value.is_function().then_some(value)
@@ -7118,7 +7702,10 @@ pub fn max_live_frames() -> usize {
 }
 
 /// Initial blank and srcdoc documents share their creator's realm setup.
-#[op2]
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
@@ -7610,24 +8197,24 @@ fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno
     parse_jwk(bytes)
 }
 
-/// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
-/// page JS drives this op on the single-threaded runtime: an unbounded
-/// iteration count pins the V8 isolate (blocking every other CDP command on the
-/// connection) and a huge output length forces an unbounded `vec![0u8; length]`
-/// allocation. Both caps sit far above any legitimate use — OWASP recommends
-/// ~600k iterations and derived keys are tens of bytes.
+/// Bound page-controlled PBKDF2 CPU work and output allocation. Normal derived
+/// keys use tens of bytes; each hash-sized output block repeats every round.
 const PBKDF2_MAX_ITERATIONS: u32 = 10_000_000;
 const PBKDF2_MAX_OUTPUT_BYTES: u32 = 1024 * 1024;
+const PBKDF2_MAX_WORK: u64 = 1_000_000_000;
 
-/// PBKDF2 key derivation with DoS guards. Split out from the op so the bounds
-/// are unit-testable without the `#[op2]` wrapper.
-fn pbkdf2_derive(
+fn pbkdf2_can_inline(work: u64, password_length: usize, salt_length: usize) -> bool {
+    work <= 4096 && password_length.saturating_add(salt_length) <= 1024
+}
+
+fn validate_pbkdf2(
     hash: &str,
-    password: &[u8],
-    salt: &[u8],
     iterations: u32,
     length: u32,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+) -> Result<u64, deno_error::JsErrorBox> {
+    if iterations == 0 {
+        return Err(crypto_err("PBKDF2 iteration count must be positive"));
+    }
     if iterations > PBKDF2_MAX_ITERATIONS {
         return Err(crypto_err(format!(
             "PBKDF2 iteration count {iterations} exceeds the supported maximum of {PBKDF2_MAX_ITERATIONS}"
@@ -7638,29 +8225,137 @@ fn pbkdf2_derive(
             "PBKDF2 output length {length} bytes exceeds the supported maximum of {PBKDF2_MAX_OUTPUT_BYTES}"
         )));
     }
-    use pbkdf2::pbkdf2_hmac;
-    let mut dk = vec![0u8; length as usize];
-    match hash {
-        "SHA-1" => pbkdf2_hmac::<sha1::Sha1>(password, salt, iterations, &mut dk),
-        "SHA-256" => pbkdf2_hmac::<sha2::Sha256>(password, salt, iterations, &mut dk),
-        "SHA-384" => pbkdf2_hmac::<sha2::Sha384>(password, salt, iterations, &mut dk),
-        "SHA-512" => pbkdf2_hmac::<sha2::Sha512>(password, salt, iterations, &mut dk),
+    let block_length = match hash {
+        "SHA-1" => 20,
+        "SHA-256" => 32,
+        "SHA-384" => 48,
+        "SHA-512" => 64,
         _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    let work = u64::from(iterations) * u64::from(length).div_ceil(block_length);
+    if work > PBKDF2_MAX_WORK {
+        return Err(crypto_err(format!(
+            "PBKDF2 work of {iterations} iterations over {length} bytes exceeds the supported maximum of {PBKDF2_MAX_WORK}"
+        )));
+    }
+    Ok(work)
+}
+
+#[cfg(test)]
+fn pbkdf2_derive(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: u32,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    pbkdf2_derive_with(hash, password, salt, iterations, length, &cancelled)
+}
+
+fn pbkdf2_derive_with(
+    hash: &str,
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    length: u32,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    validate_pbkdf2(hash, iterations, length)?;
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crypto_err("PBKDF2 derivation was cancelled"));
+    }
+    let mut dk = vec![0u8; length as usize];
+    let completed = match hash {
+        "SHA-1" => pbkdf2_blocks::<hmac::Hmac<sha1::Sha1>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-256" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha256>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-384" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha384>>(password, salt, iterations, &mut dk, cancelled),
+        "SHA-512" => pbkdf2_blocks::<hmac::Hmac<sha2::Sha512>>(password, salt, iterations, &mut dk, cancelled),
+        _ => return Err(crypto_err("unsupported PBKDF2 hash")),
+    };
+    if !completed {
+        return Err(crypto_err("PBKDF2 derivation was cancelled"));
     }
     Ok(dk)
 }
 
-/// PBKDF2 key derivation. `length` is the derived-bits output in bytes.
+fn pbkdf2_blocks<M>(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+    output: &mut [u8],
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> bool
+where
+    M: hmac::Mac + hmac::digest::KeyInit + Clone,
+{
+    use std::sync::atomic::Ordering;
+    let prf = <M as hmac::digest::KeyInit>::new_from_slice(password)
+        .expect("HMAC accepts a key of any length");
+    for (index, block) in output.chunks_mut(<M as hmac::digest::OutputSizeUser>::output_size()).enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut mac = prf.clone();
+        mac.update(salt);
+        mac.update(&(index as u32 + 1).to_be_bytes());
+        let mut value = mac.finalize().into_bytes();
+        block.copy_from_slice(&value[..block.len()]);
+        for round in 1..iterations {
+            if round % 4096 == 0 && cancelled.load(Ordering::Relaxed) {
+                return false;
+            }
+            let mut mac = prf.clone();
+            mac.update(&value);
+            value = mac.finalize().into_bytes();
+            for (byte, next) in block.iter_mut().zip(value.iter()) {
+                *byte ^= next;
+            }
+        }
+    }
+    true
+}
+
+struct CancelPbkdf2OnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelPbkdf2OnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn pbkdf2_slots() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |count| count.get());
+        std::sync::Arc::new(tokio::sync::Semaphore::new((cores / 2).max(1)))
+    })
+}
+
+/// Keep large derivations off the page thread, retaining their permits until
+/// workers exit. Small bounded work avoids blocking-pool scheduling overhead.
 #[op2]
 #[buffer]
-fn op_subtle_pbkdf2(
-    #[string] hash: &str,
-    #[buffer] password: &[u8],
-    #[buffer] salt: &[u8],
+async fn op_subtle_pbkdf2(
+    #[string] hash: String,
+    #[buffer(copy)] password: Vec<u8>,
+    #[buffer(copy)] salt: Vec<u8>,
     iterations: u32,
     length: u32,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    pbkdf2_derive(hash, password, salt, iterations, length)
+    let work = validate_pbkdf2(&hash, iterations, length)?;
+    if pbkdf2_can_inline(work, password.len(), salt.len()) {
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        return pbkdf2_derive_with(&hash, &password, &salt, iterations, length, &cancelled);
+    }
+    let slot = pbkdf2_slots().clone().acquire_owned().await
+        .map_err(|error| crypto_err(format!("PBKDF2 unavailable: {error}")))?;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelPbkdf2OnDrop(cancelled.clone());
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        pbkdf2_derive_with(&hash, &password, &salt, iterations, length, &cancelled)
+    }).await.map_err(|error| crypto_err(format!("PBKDF2 task failed: {error}")))?
 }
 
 /// Generous DoS backstop on HKDF output length. HKDF itself rejects output
@@ -8181,12 +8876,27 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+#[op2]
+#[string]
+fn op_frame_preload_scripts(state: &OpState) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        serde_json::to_string(&registry.borrow().frame_preload_scripts).unwrap_or("[]".into())
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_preload_scripts panicked; returning no scripts");
+        "[]".into()
+    })
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
         op_dom_nav(),
         op_dom_attr(),
         op_dom_text(),
+        op_form_owner(),
+        op_form_cache_buffer(),
+        op_create_select_allocator(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),
@@ -8274,6 +8984,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    ops.push(op_frame_preload_scripts());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
@@ -8561,9 +9272,13 @@ fn ensure_prepared_render_with_base_url(
             .then(|| state.prepared_render.take())
             .flatten();
         let mutations = std::mem::take(&mut state.pending_style_mutations);
-        let prepared = {
+        // Anti-panic boundary: style and layout run inside a JS op (a geometry
+        // read), and deno_core's op callbacks are `extern "C"`, so a panic in
+        // the layout engine would abort the process. A page whose layout
+        // panics loses its layout for this read instead.
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let dom = state.dom.as_ref()?;
-            match previous {
+            Some(match previous {
                 Some(previous) => obscura_render::prepare_dom_with_retained_styles_with_animation_state(
                     dom,
                     viewport,
@@ -8611,6 +9326,13 @@ fn ensure_prepared_render_with_base_url(
                         &mut state.animation_timeline,
                     )?,
                 },
+            })
+        }));
+        let prepared = match prepared {
+            Ok(prepared) => prepared?,
+            Err(_) => {
+                tracing::error!("layout panicked; the page has no layout for this read");
+                return None;
             }
         };
         if animation_sample.mode == obscura_render::AnimationSampleMode::DocumentTime {
