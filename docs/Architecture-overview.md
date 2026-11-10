@@ -125,9 +125,19 @@ their native owning document, including handles obtained through the parent.
 The document element carries that document's protocol frame ID, so Playwright
 can discover an element handle's owner frame. Retired frame handles fail
 instead of reading a same-numbered node in the main document.
-Child-frame CDP evaluation routing and iframe content compositing remain
-separate compatibility gaps; loading a document does not establish support
-for Playwright frame locators or iframe screenshot fidelity.
+Live child frames advertise their default CDP execution contexts.
+`Runtime.evaluate` and `Runtime.callFunctionOn`, including awaited calls,
+enter the frame's actual V8 realm and use its document. Remote objects remain
+in the page's central handle store, while result metadata is read in the
+owning realm. Object handles and their property handles retain the realm
+of the evaluation that produced them, not the object's creation realm.
+Calls reject retired realms and unknown or released handles rather than
+falling back to the main document.
+Pending evaluations reject retired frame contexts instead of reading a
+replacement document. Named utility contexts still alias their
+frame's realm rather than providing separate JavaScript worlds.
+Iframe content compositing remains a separate compatibility gap; evaluating
+a child document does not establish iframe screenshot fidelity.
 
 ## Robustness
 
@@ -301,6 +311,10 @@ init → commit → domcontentloaded → load → networkidle2 → networkidle0
 ## Storage
 
 `--storage-dir` persists cookies to `cookies.json` and `localStorage` to `localStorage/<origin>-<digest>.json`: read on process start, written after each navigation that changed something and on graceful shutdown. `sessionStorage` is origin-keyed in memory only, per tab.
+
+Storage objects use their original prototype to distinguish platform members from
+stored names. Replacing or deleting `window.Storage` does not break either store;
+changes to the original prototype still take effect.
 
 ## Stealth
 
