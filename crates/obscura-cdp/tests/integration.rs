@@ -41,6 +41,7 @@ integration_tests!(
     dynamic_stylesheet_onload_fires,
     execution_context_ownership,
     execution_context_pruned_on_navigation,
+    exit_when_idle,
     file_navigation_gate,
     file_upload_integrity,
     form_submission_ownership,

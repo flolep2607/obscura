@@ -806,6 +806,14 @@ fn claim_connection_memory_trim(last_trim: &AtomicU64, now: u64, idle: bool) -> 
 /// to one thread is what removes the #430 abort; the interception handshake and
 /// the nav `spawn_local` all stay on this one thread, so no cross-thread V8
 /// plumbing is needed.
+/// `OBSCURA_EXIT_WHEN_IDLE=1`: the server shuts down once its last CDP connection closes, the way a
+/// browser exits when its client disconnects. For one server per client: a launcher whose kill can
+/// be refused (an AppArmor profile that denies the signal) still gets its process back.
+fn exit_when_idle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OBSCURA_EXIT_WHEN_IDLE").is_ok_and(|v| v == "1"))
+}
+
 fn run_connection(
     std_stream: std::net::TcpStream,
     context_template: Arc<obscura_browser::BrowserContext>,
@@ -833,6 +841,7 @@ fn run_connection(
     }
 
     let slot = live_connections.clone();
+    let idle_exit = shutdown_notify.clone();
     let spawned = std::thread::Builder::new()
         .name("obscura-cdp-conn".into())
         .stack_size(CDP_CONN_STACK_BYTES)
@@ -947,6 +956,12 @@ fn run_connection(
             drop(persisted_context);
             let idle = slot_guard.release() == Some(0);
             release_connection_memory(idle);
+            if idle && exit_when_idle() {
+                // notify_one, not notify_waiters: the accept loop may be between two awaits, and
+                // the stored permit still reaches its next `notified()`.
+                info!("last CDP connection closed: exiting (OBSCURA_EXIT_WHEN_IDLE)");
+                idle_exit.notify_one();
+            }
         });
 
     // The closure never ran, so its `SlotGuard` never existed: release the
