@@ -1377,7 +1377,11 @@ impl ObscuraJsRuntime {
             gs.resolved_scroll = None;
         }
         drop(gs);
-        self.realm_states().borrow().cancel_inactive_frame_timers();
+        let realms = self.realm_states();
+        let mut realms = realms.borrow_mut();
+        realms.cancel_inactive_frame_timers();
+        realms.prune_frame_contexts();
+        realms.connect_document_frames(&self.state);
     }
 
     pub fn set_url(&self, url: &str) {
@@ -4305,6 +4309,15 @@ impl ObscuraJsRuntime {
         state.dom.as_ref().map(f)
     }
 
+    /// The live child browsing context owned by a node in the specified realm.
+    pub fn child_frame_for_node(&self, parent_frame_id: u32, node: NodeId) -> Option<u32> {
+        let realms = self.realm_states();
+        let realms = realms.borrow();
+        let parent = if parent_frame_id == 0 { self.state.clone() }
+            else { realms.by_frame_id(parent_frame_id)? };
+        realms.child_frame_for_node(&parent, node)
+    }
+
     /// Inspect a genuine remote node in its owning document, including foreign
     /// handles returned through the parent realm. Detached frame handles fail
     /// instead of resolving the same numeric node id in the main document.
@@ -5158,6 +5171,55 @@ mod tests {
             "initial":[4,["first","second","third","outer"],[0,1,2,0,0,3,0],"first",0,true,true],
             "chosen":[true,true,"third",2], "moved":[1,3], "liveRows":"function",
         }));
+    }
+
+    #[test]
+    fn select_length_snapshot_stays_live_and_private() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><optgroup><option>B</option></optgroup></select><select id='other'></select></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const select = document.getElementById('s');
+            const other = document.getElementById('other');
+            const counts = [select.length, select.length];
+            const exposed = select.options;
+            exposed.length = 0;
+            counts.push(select.length);
+            other.append(select.item(0));
+            counts.push(select.length, other.length);
+            const group = select.querySelector('optgroup');
+            group.append(new Option('C'));
+            counts.push(select.length);
+            group.replaceWith(new Option('D'));
+            counts.push(select.length);
+            const nested = document.createElement('select');
+            nested.append(new Option('hidden'));
+            select.append(nested);
+            const datalist = document.createElement('datalist');
+            datalist.append(new Option('suggested'));
+            select.append(datalist);
+            counts.push(select.length);
+            select.innerHTML = '<option>E</option><option>F</option>';
+            counts.push(select.length, select[1].text);
+            select.length = 0;
+            counts.push(select.length, select[0] === undefined);
+            select.remove();
+            select.append(new Option('detached'));
+            counts.push(select.length, select[0].text);
+            return counts;
+        })()"#).unwrap(), serde_json::json!([2,2,2,1,1,2,1,1,2,"F",0,true,1,"detached"]));
+    }
+
+    #[test]
+    fn select_length_snapshot_observes_native_dom_mutations() {
+        let mut rt = setup_runtime("<html><body><select id='s'><option>A</option><option id='b'>B</option></select></body></html>");
+        assert_eq!(rt.evaluate("(() => { globalThis.savedSelect = document.getElementById('s'); return savedSelect.length; })()")
+            .unwrap(), serde_json::json!(2.0));
+        {
+            let state = rt.state.borrow();
+            let dom = state.dom.as_ref().unwrap();
+            dom.remove_child(dom.query_selector("#b").unwrap().unwrap());
+        }
+        assert_eq!(rt.evaluate("[savedSelect.length, savedSelect[1] === undefined]").unwrap(),
+            serde_json::json!([1,true]));
     }
 
     #[test]
@@ -10797,7 +10859,7 @@ mod tests {
             second.remove();
             results.push(window.namedContext===collision);
             byId.name = 'idOnlyFrame';
-            results.push(window.idOnlyFrame===byId.contentWindow);
+            results.push(window.idOnlyFrame===byId && byId.contentWindow.name==='');
             byId.removeAttribute('name');
             results.push(window.idOnlyFrame===byId);
             const duplicate = document.createElement('div'); duplicate.id = 'idOnlyFrame';

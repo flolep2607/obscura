@@ -142,12 +142,60 @@ fn host_matches_bind(
         })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ControlRefusal {
-    BrowserOrigin,
+    BrowserOrigin(String),
     ForeignHost,
     Unauthorized,
     OversizedHead,
+}
+
+/// Origin allowlist for CDP callers, read from `OBSCURA_CDP_ALLOWED_ORIGINS`
+/// (comma-separated, `*` allows every origin). Unset accepts only the
+/// endpoint's own HTTP origin.
+fn allowed_origins_env() -> Option<String> {
+    std::env::var("OBSCURA_CDP_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+// The request authority can name the public listener instead of its worker.
+// Host validation and authentication still apply after the origin check.
+fn origin_accepted(
+    origin: &str,
+    request_host: Option<&str>,
+    allowed_origins: Option<&str>,
+) -> bool {
+    let origin = origin.trim();
+    if let Some(list) = allowed_origins {
+        if list
+            .split(',')
+            .map(str::trim)
+            .any(|entry| entry == "*" || entry.eq_ignore_ascii_case(origin))
+        {
+            return true;
+        }
+    }
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    if parsed.scheme() != "http"
+        || !origin.contains("://")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return false;
+    }
+    let Some(request_host) = request_host else {
+        return false;
+    };
+    let Ok(server) = url::Url::parse(&format!("http://{request_host}/")) else {
+        return false;
+    };
+    parsed.origin() == server.origin()
 }
 
 fn control_refusal(
@@ -156,9 +204,12 @@ fn control_refusal(
     port: u16,
     forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
+    allowed_origins: Option<&str>,
 ) -> Option<ControlRefusal> {
-    if header_value(head, "origin").is_some() {
-        return Some(ControlRefusal::BrowserOrigin);
+    if let Some(origin) = header_value(head, "origin") {
+        if !origin_accepted(origin, header_value(head, "host"), allowed_origins) {
+            return Some(ControlRefusal::BrowserOrigin(origin.to_owned()));
+        }
     }
     if !header_value(head, "host")
         .is_some_and(|host| host_matches_bind(host, bind_ip, port, forwarded))
@@ -173,17 +224,28 @@ fn control_refusal(
 
 fn refuse_control_connection(mut stream: std::net::TcpStream, refusal: ControlRefusal) {
     use std::io::Write;
-    let (status, reason) = match refusal {
+    let (status, reason) = match &refusal {
         ControlRefusal::Unauthorized => ("401 Unauthorized", "authentication required"),
         ControlRefusal::OversizedHead => (
             "431 Request Header Fields Too Large",
             "request head too large",
         ),
-        ControlRefusal::BrowserOrigin | ControlRefusal::ForeignHost => {
+        ControlRefusal::BrowserOrigin(_) | ControlRefusal::ForeignHost => {
             ("403 Forbidden", "request refused")
         }
     };
-    let body = format!("{{\"error\":\"{reason}\"}}");
+    let body = match &refusal {
+        ControlRefusal::BrowserOrigin(origin) => json!({
+            "error": reason,
+            "detail": format!(
+                "Rejected a CDP control request from the '{origin}' origin. \
+                 Set OBSCURA_CDP_ALLOWED_ORIGINS={origin} to allow connections from this \
+                 origin or OBSCURA_CDP_ALLOWED_ORIGINS=* to allow all origins."
+            ),
+        })
+        .to_string(),
+        _ => format!("{{\"error\":\"{reason}\"}}"),
+    };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -439,6 +501,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
     // under a connection burst.
     let accept_flag = shutdown_flag.clone();
     let accept_auth_token = auth_token.clone();
+    let accept_allowed_origins = allowed_origins_env();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -504,6 +567,7 @@ pub async fn start_with_serve_options_limit_and_ready_file(
                                 port,
                                 forwarded,
                                 accept_auth_token.as_deref(),
+                                accept_allowed_origins.as_deref(),
                                 &ws_tx,
                                 &head,
                             ) {
@@ -1130,10 +1194,11 @@ fn accept_dispatch(
     port: u16,
     forwarded: Option<(std::net::IpAddr, u16)>,
     auth_token: Option<&str>,
+    allowed_origins: Option<&str>,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     head: &str,
 ) -> anyhow::Result<()> {
-    if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token) {
+    if let Some(refusal) = control_refusal(head, bind_ip, port, forwarded, auth_token, allowed_origins) {
         refuse_control_connection(stream, refusal);
         return Ok(());
     }
@@ -2635,7 +2700,7 @@ mod tests {
     fn native_loopback_cdp_request_is_allowed() {
         let head = native_head("127.0.0.1:9222");
         assert_eq!(
-            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None, None),
+            control_refusal(&head, "127.0.0.1".parse().unwrap(), 9222, None, None, None),
             None
         );
     }
@@ -2653,14 +2718,16 @@ mod tests {
                 9222,
                 None,
                 None,
+                None,
             ),
-            Some(ControlRefusal::BrowserOrigin)
+            Some(ControlRefusal::BrowserOrigin("https://evil.example".to_owned()))
         );
         assert_eq!(
             control_refusal(
                 &native_head("rebind.example:9222"),
                 "127.0.0.1".parse().unwrap(),
                 9222,
+                None,
                 None,
                 None,
             ),
@@ -2673,7 +2740,7 @@ mod tests {
         let bind = "127.0.0.1".parse().unwrap();
         let forwarded = Some((bind, 9222));
         assert_eq!(
-            control_refusal(&native_head("127.0.0.1:9222"), bind, 9223, forwarded, None),
+            control_refusal(&native_head("127.0.0.1:9222"), bind, 9223, forwarded, None, None),
             None
         );
         assert_eq!(
@@ -2683,11 +2750,12 @@ mod tests {
                 9223,
                 forwarded,
                 None,
+                None,
             ),
             Some(ControlRefusal::ForeignHost)
         );
         assert_eq!(
-            control_refusal(&native_head("127.0.0.1:9444"), bind, 9223, forwarded, None),
+            control_refusal(&native_head("127.0.0.1:9444"), bind, 9223, forwarded, None, None),
             Some(ControlRefusal::ForeignHost)
         );
     }
@@ -2698,9 +2766,87 @@ mod tests {
         let public = Some(("0.0.0.0".parse().unwrap(), 9222));
         let head = native_head("cdp.example.test:9222");
         assert_eq!(
-            control_refusal(&head, bind, 9223, public, Some("secret")),
+            control_refusal(&head, bind, 9223, public, Some("secret"), None),
             Some(ControlRefusal::Unauthorized)
         );
+    }
+
+    #[test]
+    fn endpoint_origins_are_accepted_without_configuration() {
+        for (origin, host) in [
+            ("http://127.0.0.1:9222", "127.0.0.1:9222"),
+            ("HTTP://LOCALHOST:9222", "localhost:9222"),
+            ("http://[::1]:9222", "[::1]:9222"),
+            ("http://192.168.1.10:9333", "192.168.1.10:9333"),
+            ("http://localhost", "localhost:80"),
+            ("http://cdp.example.test:9222", "cdp.example.test:9222"),
+        ] {
+            assert!(super::origin_accepted(origin, Some(host), None), "{origin}");
+        }
+    }
+
+    #[test]
+    fn foreign_and_malformed_origins_stay_refused_without_configuration() {
+        for origin in [
+            "https://evil.example",
+            "http://evil.example:8080",
+            "http://rebind.example:9222",
+            "http://127.0.0.1:7777",
+            "http://localhost:9222",
+            "https://127.0.0.1:9222",
+            "http://user@127.0.0.1:9222",
+            "http://user:pass@127.0.0.1:9222",
+            "http://127.0.0.1:9222/path",
+            "http://127.0.0.1:9222/?query",
+            "http://127.0.0.1:9222/#fragment",
+            "http:127.0.0.1:9222",
+            "null",
+            "",
+        ] {
+            assert!(!super::origin_accepted(origin, Some("127.0.0.1:9222"), None), "{origin}");
+        }
+        assert!(!super::origin_accepted("http://127.0.0.1:9222", None, None));
+    }
+
+    #[test]
+    fn allowed_origins_list_overrides_the_default_policy() {
+        let host = Some("127.0.0.1:9222");
+        let list = Some("http://dev.example:4173, https://tunnel.example");
+        assert!(super::origin_accepted("http://dev.example:4173", host, list));
+        assert!(super::origin_accepted("https://tunnel.example", host, list));
+        assert!(super::origin_accepted("  https://tunnel.example ", host, list));
+        assert!(!super::origin_accepted("http://other.example", host, list));
+        assert!(super::origin_accepted("http://anything.example", host, Some("*")));
+        assert!(super::origin_accepted("null", host, Some("null")));
+        assert!(super::origin_accepted("HTTP://DEV.EXAMPLE:4173", host, list));
+    }
+
+    #[test]
+    fn allowed_origins_preserve_forwarded_host_and_authentication_checks() {
+        let bind = "127.0.0.1".parse().unwrap();
+        let forwarded = Some((bind, 9222));
+        let token = "01234567890123456789012345678901";
+        let with_origin = |host, origin| native_head(host).replace(
+            "Upgrade: websocket", &format!("Origin: {origin}\r\nUpgrade: websocket"),
+        );
+        assert_eq!(control_refusal(
+            &with_origin("127.0.0.1:9222", "http://127.0.0.1:9222"),
+            bind, 9223, forwarded, None, None,
+        ), None);
+        assert_eq!(control_refusal(
+            &with_origin("rebind.example:9222", "http://rebind.example:9222"),
+            bind, 9223, forwarded, None, Some("*"),
+        ), Some(ControlRefusal::ForeignHost));
+        assert_eq!(control_refusal(
+            &with_origin("127.0.0.1:9222", "https://allowed.example"),
+            bind, 9223, forwarded, Some(token), Some("https://allowed.example"),
+        ), Some(ControlRefusal::Unauthorized));
+        let authenticated = with_origin("cdp.example.test:9222", "http://cdp.example.test:9222")
+            .replace("Upgrade: websocket", &format!("Authorization: Bearer {token}\r\nUpgrade: websocket"));
+        assert_eq!(control_refusal(
+            &authenticated, bind, 9223, Some(("0.0.0.0".parse().unwrap(), 9222)),
+            Some(token), None,
+        ), None);
     }
 
     #[test]
