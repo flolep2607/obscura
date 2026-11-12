@@ -165,6 +165,7 @@ fn origin_accepted(
     origin: &str,
     request_host: Option<&str>,
     allowed_origins: Option<&str>,
+    authenticated: bool,
 ) -> bool {
     let origin = origin.trim();
     if let Some(list) = allowed_origins {
@@ -195,7 +196,12 @@ fn origin_accepted(
     let Ok(server) = url::Url::parse(&format!("http://{request_host}/")) else {
         return false;
     };
-    parsed.origin() == server.origin()
+    // A DNS name can be rebound to this server, making an attacker page
+    // same-origin with its own Host header. Without a token, only IP literals
+    // and localhost prove the caller targeted this endpoint; other names need
+    // the allowlist. A rebinding page cannot present the bearer token.
+    let rebindable = !authenticated && matches!(server.host(), Some(url::Host::Domain(d)) if !d.eq_ignore_ascii_case("localhost"));
+    !rebindable && parsed.origin() == server.origin()
 }
 
 fn control_refusal(
@@ -207,7 +213,7 @@ fn control_refusal(
     allowed_origins: Option<&str>,
 ) -> Option<ControlRefusal> {
     if let Some(origin) = header_value(head, "origin") {
-        if !origin_accepted(origin, header_value(head, "host"), allowed_origins) {
+        if !origin_accepted(origin, header_value(head, "host"), allowed_origins, auth_token.is_some()) {
             return Some(ControlRefusal::BrowserOrigin(origin.to_owned()));
         }
     }
@@ -2779,10 +2785,17 @@ mod tests {
             ("http://[::1]:9222", "[::1]:9222"),
             ("http://192.168.1.10:9333", "192.168.1.10:9333"),
             ("http://localhost", "localhost:80"),
-            ("http://cdp.example.test:9222", "cdp.example.test:9222"),
         ] {
-            assert!(super::origin_accepted(origin, Some(host), None), "{origin}");
+            assert!(super::origin_accepted(origin, Some(host), None, false), "{origin}");
         }
+    }
+
+    #[test]
+    fn rebindable_domain_origins_need_the_allowlist() {
+        let host = Some("evil.example:9222");
+        assert!(!super::origin_accepted("http://evil.example:9222", host, None, false));
+        assert!(super::origin_accepted("http://evil.example:9222", host, Some("http://evil.example:9222"), false));
+        assert!(super::origin_accepted("http://evil.example:9222", host, None, true));
     }
 
     #[test]
@@ -2803,22 +2816,22 @@ mod tests {
             "null",
             "",
         ] {
-            assert!(!super::origin_accepted(origin, Some("127.0.0.1:9222"), None), "{origin}");
+            assert!(!super::origin_accepted(origin, Some("127.0.0.1:9222"), None, false), "{origin}");
         }
-        assert!(!super::origin_accepted("http://127.0.0.1:9222", None, None));
+        assert!(!super::origin_accepted("http://127.0.0.1:9222", None, None, false));
     }
 
     #[test]
     fn allowed_origins_list_overrides_the_default_policy() {
         let host = Some("127.0.0.1:9222");
         let list = Some("http://dev.example:4173, https://tunnel.example");
-        assert!(super::origin_accepted("http://dev.example:4173", host, list));
-        assert!(super::origin_accepted("https://tunnel.example", host, list));
-        assert!(super::origin_accepted("  https://tunnel.example ", host, list));
-        assert!(!super::origin_accepted("http://other.example", host, list));
-        assert!(super::origin_accepted("http://anything.example", host, Some("*")));
-        assert!(super::origin_accepted("null", host, Some("null")));
-        assert!(super::origin_accepted("HTTP://DEV.EXAMPLE:4173", host, list));
+        assert!(super::origin_accepted("http://dev.example:4173", host, list, false));
+        assert!(super::origin_accepted("https://tunnel.example", host, list, false));
+        assert!(super::origin_accepted("  https://tunnel.example ", host, list, false));
+        assert!(!super::origin_accepted("http://other.example", host, list, false));
+        assert!(super::origin_accepted("http://anything.example", host, Some("*"), false));
+        assert!(super::origin_accepted("null", host, Some("null"), false));
+        assert!(super::origin_accepted("HTTP://DEV.EXAMPLE:4173", host, list, false));
     }
 
     #[test]

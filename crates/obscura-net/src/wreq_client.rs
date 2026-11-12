@@ -779,6 +779,8 @@ impl StealthHttpClient {
 
         let mut redirects = Vec::new();
         let mut redirect_tainted = false;
+        // Latched on the first cross-origin hop: covers extra_headers too, not just request_headers.
+        let mut strip_authorization = false;
         let mut referrer = request.referrer.clone().or_else(|| request.initiator.clone());
         let mut request_callback_fired = false;
 
@@ -828,7 +830,9 @@ impl StealthHttpClient {
                 req = req.header("user-agent", ua.as_str());
             }
             for (k, v) in effective_headers.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent")) {
-                if k.eq_ignore_ascii_case("origin") {
+                if k.eq_ignore_ascii_case("origin")
+                    || (strip_authorization && k.eq_ignore_ascii_case("authorization"))
+                {
                     continue;
                 }
                 req = req.header(k.as_str(), v.as_str());
@@ -905,11 +909,7 @@ impl StealthHttpClient {
                         .map_err(|error| ObscuraNetError::Network(format!("Invalid redirect referrer: {error}")))?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
-                    if next_url.origin() != current_url.origin() {
-                        if let Some(headers) = request_headers.as_mut() {
-                            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
-                        }
-                    }
+                    strip_authorization |= next_url.origin() != current_url.origin();
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if (status.as_u16() == 303 && method != wreq::Method::GET && method != wreq::Method::HEAD)

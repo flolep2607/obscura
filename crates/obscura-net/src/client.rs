@@ -1094,8 +1094,11 @@ struct Conditional {
 /// Cacheability and freshness for a response. `304` is accepted so a
 /// revalidation answer can refresh an entry's lifetime when the origin
 /// sent a new `cache-control` alongside it.
-fn response_cache_lifetime(response: &Response, response_delay: Duration) -> Option<Duration> {
-    response_cache_lifetime_with_clock(response, response_delay, || {
+fn response_cache_lifetime(response: &Response, response_delay: Duration, resource_type: ResourceType) -> Option<Duration> {
+    // Heuristic freshness is for static subresources. XHR/fetch usually hit
+    // APIs whose Last-Modified says nothing about how long the data stays valid.
+    let heuristic = !matches!(resource_type, ResourceType::Xhr | ResourceType::Fetch);
+    response_cache_lifetime_with_clock(response, response_delay, heuristic, || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
@@ -1106,6 +1109,7 @@ fn response_cache_lifetime(response: &Response, response_delay: Duration) -> Opt
 fn response_cache_lifetime_with_clock(
     response: &Response,
     response_delay: Duration,
+    heuristic: bool,
     now: impl FnOnce() -> Option<u64>,
 ) -> Option<Duration> {
     if (!(200..300).contains(&response.status) && response.status != 304)
@@ -1144,6 +1148,9 @@ fn response_cache_lifetime_with_clock(
         if let Some(seconds) = max_age {
             return (seconds > 0).then(|| Duration::from_secs(seconds));
         }
+    }
+    if !heuristic {
+        return None;
     }
     heuristic_cache_lifetime(response, now()?, response_delay)
 }
@@ -1557,7 +1564,7 @@ impl ObscuraHttpClient {
                         // Honor a fresh max-age from the origin; otherwise
                         // the entry keeps the lifetime it was stored with.
                         let lifetime =
-                            response_cache_lifetime(&revalidation, revalidation_started.elapsed()).unwrap_or(entry.lifetime);
+                            response_cache_lifetime(&revalidation, revalidation_started.elapsed(), cache_key.resource_type).unwrap_or(entry.lifetime);
                         process_resource_loader().lock().unwrap().cache.insert(
                             cache_key,
                             refreshed.clone(),
@@ -1567,7 +1574,7 @@ impl ObscuraHttpClient {
                     }
                     // 200 (or any non-304): the origin replaced the body.
                     Ok(response) => {
-                        if let Some(lifetime) = response_cache_lifetime(&response, revalidation_started.elapsed()) {
+                        if let Some(lifetime) = response_cache_lifetime(&response, revalidation_started.elapsed(), cache_key.resource_type) {
                             process_resource_loader()
                                 .lock()
                                 .unwrap()
@@ -1687,7 +1694,7 @@ impl ObscuraHttpClient {
                     )
                     .await;
                 let shared_outcome = match &result {
-                    Ok(response) => match response_cache_lifetime(response, request_started.elapsed()) {
+                    Ok(response) => match response_cache_lifetime(response, request_started.elapsed(), cache_key.resource_type) {
                         Some(lifetime) => {
                             process_resource_loader().lock().unwrap().cache.insert(
                                 cache_key,
@@ -1814,6 +1821,8 @@ impl ObscuraHttpClient {
         // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
+        // Latched on the first cross-origin hop: covers extra_headers too, not just request_headers.
+        let mut strip_authorization = false;
         let mut referrer = request.referrer.clone().or_else(|| request.initiator.clone());
         let mut request_callback_fired = false;
 
@@ -1950,6 +1959,9 @@ impl ObscuraHttpClient {
             let extra_headers = self.extra_headers.read().await;
             let supplied = request_headers.as_ref();
             for (k, v) in supplied.unwrap_or(&extra_headers).iter() {
+                if strip_authorization && k.eq_ignore_ascii_case("authorization") {
+                    continue;
+                }
                 if let (Ok(name), Ok(val)) = (
                     HeaderName::from_bytes(k.as_bytes()),
                     HeaderValue::from_str(v),
@@ -2061,11 +2073,7 @@ impl ObscuraHttpClient {
                         .map_err(|error| ObscuraNetError::Network(format!("Invalid redirect referrer: {error}")))?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
-                    if next_url.origin() != current_url.origin() {
-                        if let Some(headers) = request_headers.as_mut() {
-                            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
-                        }
-                    }
+                    strip_authorization |= next_url.origin() != current_url.origin();
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     if ((status == reqwest::StatusCode::MOVED_PERMANENTLY || status == reqwest::StatusCode::FOUND) && method == Method::POST)
@@ -2298,7 +2306,7 @@ mod resource_cache_tests {
 
     // Receive the dated unit fixtures at their Date, independent of the wall clock.
     fn cache_lifetime_at_fixture_time(response: &Response) -> Option<Duration> {
-        response_cache_lifetime_with_clock(response, Duration::ZERO, || {
+        response_cache_lifetime_with_clock(response, Duration::ZERO, true, || {
             crate::cookies::parse_http_date("Fri, 06 Nov 2026 08:59:06 GMT").ok()
         })
     }
@@ -2311,6 +2319,16 @@ mod resource_cache_tests {
             ("last-modified", "Mon, 02 Nov 2026 11:57:20 GMT"),
         ]);
         assert_eq!(cache_lifetime_at_fixture_time(&response), Some(Duration::from_secs(33490)));
+    }
+
+    #[test]
+    fn api_fetches_get_no_heuristic_freshness() {
+        let response = heuristic_test_response(200, &[("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT")]);
+        for resource_type in [ResourceType::Xhr, ResourceType::Fetch] {
+            assert_eq!(super::response_cache_lifetime(&response, Duration::ZERO, resource_type), None);
+        }
+        let explicit = heuristic_test_response(200, &[("cache-control", "max-age=60")]);
+        assert_eq!(super::response_cache_lifetime(&explicit, Duration::ZERO, ResourceType::Fetch), Some(Duration::from_secs(60)));
     }
 
     #[test]
@@ -2359,7 +2377,7 @@ mod resource_cache_tests {
                 ("last-modified", "Mon, 01 Jan 2018 00:00:00 GMT"),
                 ("cache-control", directive),
             ]);
-            assert_eq!(response_cache_lifetime(&response, Duration::ZERO), None, "{directive}");
+            assert_eq!(response_cache_lifetime(&response, Duration::ZERO, ResourceType::Script), None, "{directive}");
         }
     }
 
@@ -2383,7 +2401,7 @@ mod resource_cache_tests {
             ],
         ] {
             assert_eq!(
-                response_cache_lifetime(&heuristic_test_response(200, &headers), Duration::ZERO),
+                response_cache_lifetime(&heuristic_test_response(200, &headers), Duration::ZERO, ResourceType::Script),
                 None,
                 "{headers:?}",
             );
@@ -2400,15 +2418,15 @@ mod resource_cache_tests {
         let now = crate::cookies::parse_http_date("Fri, 06 Nov 2026 08:59:06 GMT").unwrap();
         let delay = Duration::from_millis(200);
         assert_eq!(
-            response_cache_lifetime_with_clock(&response, delay, || Some(now)),
+            response_cache_lifetime_with_clock(&response, delay, true, || Some(now)),
             Some(Duration::from_secs(32490) - delay),
         );
         assert_eq!(
-            response_cache_lifetime_with_clock(&response, delay, || Some(now + 2000)),
+            response_cache_lifetime_with_clock(&response, delay, true, || Some(now + 2000)),
             Some(Duration::from_secs(31490)),
         );
         assert_eq!(
-            response_cache_lifetime_with_clock(&response, Duration::from_secs(33490), || Some(now)),
+            response_cache_lifetime_with_clock(&response, Duration::from_secs(33490), true, || Some(now)),
             None,
         );
     }

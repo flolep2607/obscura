@@ -71,3 +71,49 @@ async fn navigation_interception_redirects_preserve_method_and_body() {
 async fn navigation_interception_redirects_preserve_method_and_body_in_stealth() {
     tokio::time::timeout(std::time::Duration::from_secs(10),redirects_preserve_method_and_body(true)).await.unwrap();
 }
+
+/// Authorization from setExtraHTTPHeaders must not follow a cross-origin redirect.
+async fn extra_header_authorization_stops_at_origin_change(stealth: bool) {
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = url::Url::parse(&format!("http://{}/start", first.local_addr().unwrap())).unwrap();
+    let target = format!("http://{}/finish", second.local_addr().unwrap());
+    let fixture = tokio::spawn(async move {
+        let (mut socket, _) = first.accept().await.unwrap();
+        let (head, _) = request(&mut socket).await;
+        assert!(head.to_ascii_lowercase().contains("authorization: bearer test"), "{head}");
+        socket.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let (mut socket, _) = second.accept().await.unwrap();
+        let (head, _) = request(&mut socket).await;
+        assert!(!head.to_ascii_lowercase().contains("authorization"), "credentials crossed origins: {head}");
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+    });
+    let headers = std::collections::HashMap::from([("Authorization".to_string(), "Bearer test".to_string())]);
+    let status = if stealth {
+        #[cfg(feature = "stealth")]
+        {
+            let client = obscura_net::StealthHttpClient::with_proxy(Arc::new(CookieJar::new()), None, true);
+            client.set_extra_headers(headers).await;
+            client.fetch(&url).await.unwrap().status
+        }
+        #[cfg(not(feature = "stealth"))]
+        unreachable!()
+    } else {
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        client.set_extra_headers(headers).await;
+        client.fetch(&url).await.unwrap().status
+    };
+    assert_eq!(status, 200);
+    fixture.await.unwrap();
+}
+
+#[tokio::test]
+async fn extra_header_authorization_is_dropped_on_cross_origin_redirect() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), extra_header_authorization_stops_at_origin_change(false)).await.unwrap();
+}
+
+#[cfg(feature = "stealth")]
+#[tokio::test]
+async fn extra_header_authorization_is_dropped_on_cross_origin_redirect_in_stealth() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), extra_header_authorization_stops_at_origin_change(true)).await.unwrap();
+}
